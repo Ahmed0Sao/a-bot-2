@@ -1,0 +1,26 @@
+{
+  "files": {
+    "commands/general/robux.js": [
+      {
+        "id": "57fc4eff-e759-4b2b-8dc9-6bc74766027d",
+        "line": 316,
+        "version": 1,
+        "index": 13020
+      },
+      {
+        "id": "47ea62ef-b472-4927-a953-28b2064e599e",
+        "line": 383,
+        "version": 1,
+        "index": 14999
+      }
+    ],
+    "index.js": [
+      {
+        "id": "7e644b9f-55a6-425c-be2c-38c41642c4c6",
+        "line": 25,
+        "version": 1,
+        "index": 749
+      }
+    ]
+  }
+}
