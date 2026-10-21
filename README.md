@@ -47,6 +47,17 @@ Free-tier limits are counted per model, so a model that has used up its daily re
 - If every model is used up the log lists them all with the reason, and the last HTTP response in full.
 - Quotas change over time. Check what each model currently allows at aistudio.google.com/rate-limit. Linking a billing account to the project (Tier 1) removes the free-tier daily caps.
 
+## Reference file (Attach file)
+
+Small models make mistakes when they answer from memory. Under "Reference file" in the app, tap Attach file and pick your study material. From then on every question is sent together with that file, and the model is told to answer from it, not from memory. With no file attached nothing changes: the model answers from its own knowledge.
+
+- Supported: PDF (scanned PDFs work too), text files in any encoding (UTF-8, UTF-16, Arabic windows-1256), Word (.docx), PowerPoint (.pptx), and images (PNG, JPEG, WEBP). Word and PowerPoint files are turned into plain text once, when you attach them. Old .doc/.ppt, Excel and other formats are refused with a message: export them as PDF or text first.
+- One file at a time; attaching another replaces it. Remove file goes back to answering without a file.
+- Limits: PDF and images up to 15 MB (they are sent with every question), text is cut after 800,000 characters (the Reference line shows when that happened). A PDF page costs about 258 tokens, so very long PDFs use more of the per-minute token quota.
+- The file is stored only inside the app on the phone and is sent to Google's Gemini API with each question, like the screenshot.
+- Check the file with Gemini sends the file with one tiny question (uses 1 request) and shows what the model read from it, so a problem shows up before you need it.
+- The model must copy the passage it used into an "evidence" field. The log shows it: for text, Word and PowerPoint files the app also checks that the quote really occurs in the file and logs a WARNING when it does not (a sign the model made it up). For PDFs and images the quote cannot be checked on the phone. If the file does not cover a question, the model answers from its own knowledge and the log says so.
+
 ## Log
 
 Open log in the app shows every step: key press, screenshot size and timing, which route was used, the model's raw reply, the tap coordinates, and any error with its full stack trace or HTTP response body. Copy all puts the whole log on the clipboard. Crashes are logged too.

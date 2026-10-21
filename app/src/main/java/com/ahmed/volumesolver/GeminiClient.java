@@ -50,6 +50,12 @@ final class GeminiClient {
         String raw = "";
         /** The model that produced the answer (can be a fallback). */
         String model = "";
+        /** Name of the reference file that was sent with the question, "" if none. */
+        String reference = "";
+        /** The passage of the reference file the model says supports its answer. */
+        String evidence = "";
+        /** Whether that passage really occurs in the file: null when it cannot be checked (PDF, image, no quote). */
+        Boolean evidenceInReference;
         double yMin;
         double xMin;
         double yMax;
@@ -67,6 +73,37 @@ final class GeminiClient {
             this.text = text;
             this.model = model;
             this.notes = notes;
+        }
+    }
+
+    /** One piece of the request content, in the order it is sent. */
+    private static final class Piece {
+        static final String TEXT = "text";
+        static final String IMAGE = "image";
+        static final String DOCUMENT = "document";
+
+        final String type;
+        /** MIME type of image and document pieces. */
+        final String mime;
+        /** The text, or the base64 data of an image or document. */
+        final String data;
+
+        private Piece(String type, String mime, String data) {
+            this.type = type;
+            this.mime = mime;
+            this.data = data;
+        }
+
+        static Piece text(String text) {
+            return new Piece(TEXT, null, text);
+        }
+
+        static Piece image(String mime, byte[] bytes) {
+            return new Piece(IMAGE, mime, Base64.encodeToString(bytes, Base64.NO_WRAP));
+        }
+
+        static Piece document(String mime, byte[] bytes) {
+            return new Piece(DOCUMENT, mime, Base64.encodeToString(bytes, Base64.NO_WRAP));
         }
     }
 
@@ -112,8 +149,22 @@ final class GeminiClient {
     }
 
     static Answer solve(Context ctx, String apiKey, String model, byte[] jpeg) throws IOException, JSONException {
-        String image = Base64.encodeToString(jpeg, Base64.NO_WRAP);
-        Reply r = generate(ctx, apiKey, model, PROMPT, image, true, false);
+        // The optional reference file goes first, then the screenshot, then the instructions.
+        Reference.Payload ref = null;
+        try {
+            ref = Reference.load(ctx);
+        } catch (IOException e) {
+            Logs.e(ctx, TAG, "The attached reference file could not be loaded, so this question is sent without it", e);
+        }
+        List<Piece> pieces = new ArrayList<>();
+        if (ref != null) {
+            pieces.addAll(referencePieces(ref));
+            Logs.i(ctx, TAG, "Sending the reference file with the question: " + ref.info.describe());
+        }
+        pieces.add(Piece.image("image/jpeg", jpeg));
+        pieces.add(Piece.text(ref == null ? PROMPT : referencePrompt(ref.info.name)));
+
+        Reply r = generate(ctx, apiKey, model, pieces, true, false);
         String reply = r.text;
         Logs.i(ctx, TAG, "Raw reply from " + r.model + ": " + reply);
 
@@ -130,6 +181,11 @@ final class GeminiClient {
         a.model = r.model;
         a.found = json.optBoolean("found", true);
         a.text = json.optString("answer", "");
+        if (ref != null) {
+            a.reference = ref.info.name;
+            a.evidence = json.optString("evidence", "").trim();
+            a.evidenceInReference = Reference.quoteInText(ref.text, a.evidence);
+        }
         JSONArray box = json.optJSONArray("box_2d");
         if (box != null && box.length() >= 4) {
             a.yMin = box.optDouble(0, 0);
@@ -148,8 +204,58 @@ final class GeminiClient {
      * always shows the current state, and it refreshes that memory.
      */
     static Reply ping(Context ctx, String apiKey, String model) throws IOException, JSONException {
-        Reply r = generate(ctx, apiKey, model, "Reply with the single word OK.", null, false, true);
+        List<Piece> pieces = new ArrayList<>();
+        pieces.add(Piece.text("Reply with the single word OK."));
+        Reply r = generate(ctx, apiKey, model, pieces, false, true);
         return new Reply(r.text.trim(), r.model, r.notes);
+    }
+
+    /**
+     * Used by the "Test API key" button when a reference file is attached: sends the file with a tiny question to
+     * prove that Google accepts it and that the model can read it.
+     */
+    static Reply checkReference(Context ctx, String apiKey, String model) throws IOException, JSONException {
+        Reference.Payload ref = Reference.load(ctx);
+        if (ref == null) {
+            throw new IOException("No reference file is attached.");
+        }
+        List<Piece> pieces = new ArrayList<>(referencePieces(ref));
+        pieces.add(Piece.text("Quote the first sentence of the reference document word for word (at most 25 words) "
+                + "and write nothing else."));
+        Reply r = generate(ctx, apiKey, model, pieces, false, true);
+        return new Reply(r.text.trim(), r.model, r.notes);
+    }
+
+    private static List<Piece> referencePieces(Reference.Payload ref) {
+        List<Piece> pieces = new ArrayList<>();
+        if (ref.info.kind.equals(Reference.KIND_TEXT)) {
+            pieces.add(Piece.text("REFERENCE DOCUMENT \"" + ref.info.name + "\" (the trusted source for the answer):\n"
+                    + ref.text + "\n--- END OF REFERENCE DOCUMENT ---"));
+        } else if (ref.info.kind.equals(Reference.KIND_PDF)) {
+            pieces.add(Piece.document(ref.info.mime, ref.bytes));
+        } else {
+            pieces.add(Piece.image(ref.info.mime, ref.bytes));
+        }
+        return pieces;
+    }
+
+    private static String referencePrompt(String fileName) {
+        return "This is a screenshot of a phone that shows a question with several selectable answer options. "
+                + "A reference document (" + fileName + ") was provided before the screenshot. It is the trusted "
+                + "source: answer from it, not from memory. Find the passage of the document that answers the "
+                + "question, then pick the option that passage supports. "
+                + "Reply with JSON only (no other text) using exactly these keys, in this order: "
+                + "\"found\": true if a question with selectable options is visible, otherwise false; "
+                + "\"evidence\": a short quote (at most 200 characters) copied word for word from the reference "
+                + "document that answers the question, or an empty string if the document does not cover the question; "
+                + "\"answer\": the exact text of the correct option, or only its letter or number if that is all the "
+                + "screen shows; "
+                + "\"box_2d\": [ymin, xmin, ymax, xmax], the tappable area of that option (the whole row or button, "
+                + "not just its letter or number), as integers from 0 to 1000 relative to the image height and width. "
+                + "Only if the document does not cover the question, use your own knowledge and leave evidence empty. "
+                + "If you are unsure, pick the most likely option. "
+                + "If no question is visible, reply {\"found\": false, \"evidence\": \"\", \"answer\": \"\", "
+                + "\"box_2d\": [0, 0, 0, 0]}.";
     }
 
     /** The main model first, then the fallbacks, without duplicates. Fallbacks may be separated by , ; space or newline. */
@@ -174,8 +280,8 @@ final class GeminiClient {
 
     // ---------------------------------------------------------------- model selection
 
-    private static Reply generate(Context ctx, String apiKey, String primary, String prompt, String image,
-                                  boolean json, boolean ignoreSkips) throws IOException, JSONException {
+    private static Reply generate(Context ctx, String apiKey, String primary, List<Piece> pieces, boolean json,
+                                  boolean ignoreSkips) throws IOException, JSONException {
         List<String> chain = modelChain(primary, Prefs.fallbacks(ctx));
         long now = System.currentTimeMillis();
 
@@ -206,7 +312,7 @@ final class GeminiClient {
                 continue;
             }
             try {
-                String text = generateWith(ctx, apiKey, m, prompt, image, json);
+                String text = generateWith(ctx, apiKey, m, pieces, json);
                 if (until > 0) {
                     Prefs.clearSkip(ctx, m);
                 }
@@ -312,8 +418,8 @@ final class GeminiClient {
 
     // ---------------------------------------------------------------- route selection (one model)
 
-    /** Sends the prompt (and optional JPEG as base64) to one model and returns its text. */
-    private static String generateWith(Context ctx, String apiKey, String name, String prompt, String image,
+    /** Sends the pieces (reference file, screenshot, instructions) to one model and returns its text. */
+    private static String generateWith(Context ctx, String apiKey, String name, List<Piece> pieces,
                                        boolean json) throws IOException, JSONException {
         String thinking = Prefs.thinking(ctx);
 
@@ -324,7 +430,7 @@ final class GeminiClient {
 
         ApiException firstError;
         try {
-            String reply = viaRoute(ctx, first, apiKey, name, prompt, image, json, thinking);
+            String reply = viaRoute(ctx, first, apiKey, name, pieces, json, thinking);
             remember(ctx, first);
             return reply;
         } catch (ApiException e) {
@@ -340,7 +446,7 @@ final class GeminiClient {
         Logs.i(ctx, TAG, "The " + first + " route was rejected for " + name + ", trying the " + second
                 + " route instead. First error:\n" + firstError.getMessage());
         try {
-            String reply = viaRoute(ctx, second, apiKey, name, prompt, image, json, thinking);
+            String reply = viaRoute(ctx, second, apiKey, name, pieces, json, thinking);
             remember(ctx, second);
             return reply;
         } catch (ApiException e) {
@@ -377,15 +483,15 @@ final class GeminiClient {
         }
     }
 
-    private static String viaRoute(Context ctx, String route, String apiKey, String name, String prompt,
-                                   String image, boolean json, String thinking) throws IOException, JSONException {
+    private static String viaRoute(Context ctx, String route, String apiKey, String name, List<Piece> pieces,
+                                   boolean json, String thinking) throws IOException, JSONException {
         boolean interactions = route.equals(ROUTE_INTERACTIONS);
         String url = interactions ? API_ROOT + "interactions" : API_ROOT + "models/" + name + ":generateContent";
         boolean options = true;
         while (true) {
             JSONObject body = interactions
-                    ? interactionsBody(name, prompt, image, thinking, options)
-                    : generateBody(prompt, image, json, thinking, options);
+                    ? interactionsBody(name, pieces, thinking, options)
+                    : generateBody(pieces, json, thinking, options);
             try {
                 String response = post(ctx, url, route, name, apiKey, body);
                 return interactions ? interactionsText(response) : generateText(response);
@@ -403,14 +509,17 @@ final class GeminiClient {
 
     // ---------------------------------------------------------------- request bodies
 
-    private static JSONObject generateBody(String prompt, String image, boolean json, String thinking,
-                                           boolean options) throws JSONException {
+    private static JSONObject generateBody(List<Piece> pieces, boolean json, String thinking, boolean options)
+            throws JSONException {
         JSONArray parts = new JSONArray();
-        if (image != null) {
-            JSONObject inline = new JSONObject().put("mime_type", "image/jpeg").put("data", image);
-            parts.put(new JSONObject().put("inline_data", inline));
+        for (Piece p : pieces) {
+            if (p.type.equals(Piece.TEXT)) {
+                parts.put(new JSONObject().put("text", p.data));
+            } else {
+                JSONObject inline = new JSONObject().put("mime_type", p.mime).put("data", p.data);
+                parts.put(new JSONObject().put("inline_data", inline));
+            }
         }
-        parts.put(new JSONObject().put("text", prompt));
         JSONObject body = new JSONObject()
                 .put("contents", new JSONArray().put(new JSONObject().put("parts", parts)));
 
@@ -427,13 +536,16 @@ final class GeminiClient {
         return body;
     }
 
-    private static JSONObject interactionsBody(String model, String prompt, String image, String thinking,
-                                               boolean options) throws JSONException {
+    private static JSONObject interactionsBody(String model, List<Piece> pieces, String thinking, boolean options)
+            throws JSONException {
         JSONArray input = new JSONArray();
-        if (image != null) {
-            input.put(new JSONObject().put("type", "image").put("data", image).put("mime_type", "image/jpeg"));
+        for (Piece p : pieces) {
+            if (p.type.equals(Piece.TEXT)) {
+                input.put(new JSONObject().put("type", "text").put("text", p.data));
+            } else {
+                input.put(new JSONObject().put("type", p.type).put("data", p.data).put("mime_type", p.mime));
+            }
         }
-        input.put(new JSONObject().put("type", "text").put("text", prompt));
         JSONObject body = new JSONObject().put("model", model).put("input", input);
         if (options) {
             body.put("store", false); // do not keep the screenshot in an interaction history

@@ -34,6 +34,7 @@ public class SolverService extends AccessibilityService {
         super.onServiceConnected();
         Logs.i(this, TAG, "Service connected. model=" + Prefs.model(this)
                 + ", fallbacks=[" + Prefs.fallbacks(this) + "]"
+                + ", reference file=" + Reference.describe(this)
                 + ", active=" + Prefs.active(this)
                 + ", API key " + (Prefs.apiKey(this).isEmpty() ? "NOT set" : "set"));
     }
@@ -119,6 +120,7 @@ public class SolverService extends AccessibilityService {
             shot.recycle();
 
             GeminiClient.Answer answer = GeminiClient.solve(this, Prefs.apiKey(this), Prefs.model(this), jpeg);
+            logEvidence(answer);
             if (!answer.found) {
                 fail(blank
                         ? "The screenshot is completely black: this app probably blocks screen capture (FLAG_SECURE)."
@@ -145,6 +147,27 @@ public class SolverService extends AccessibilityService {
         } catch (Throwable t) {
             fail("Request failed", t);
         }
+    }
+
+    /** With a reference file attached: what the model quoted from it, and whether the quote is really in the file. */
+    private void logEvidence(GeminiClient.Answer answer) {
+        if (answer.reference.isEmpty()) {
+            return;
+        }
+        if (answer.evidence.isEmpty()) {
+            Logs.i(this, TAG, "Reference file " + answer.reference + ": " + answer.model + " found no passage that "
+                    + "answers this question and used its own knowledge.");
+            return;
+        }
+        String check;
+        if (answer.evidenceInReference == null) {
+            check = "not checked, the file is a PDF or image";
+        } else if (answer.evidenceInReference) {
+            check = "this quote is in the file";
+        } else {
+            check = "WARNING: this quote was NOT found in the file, the model may have made it up";
+        }
+        Logs.i(this, TAG, "Evidence from " + answer.reference + ": \"" + answer.evidence + "\" (" + check + ")");
     }
 
     private void tap(float x, float y) {

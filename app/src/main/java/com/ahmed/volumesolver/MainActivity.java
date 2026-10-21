@@ -2,10 +2,13 @@ package com.ahmed.volumesolver;
 
 import android.app.Activity;
 import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.text.InputType;
 import android.view.View;
@@ -17,10 +20,16 @@ import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 
+import java.io.IOException;
+import java.io.InputStream;
+
 public class MainActivity extends Activity {
+
+    private static final int REQUEST_PICK_FILE = 41;
 
     private TextView status;
     private TextView testOutput;
+    private TextView referenceStatus;
     private EditText keyField;
     private EditText modelField;
     private EditText fallbackField;
@@ -87,6 +96,22 @@ public class MainActivity extends Activity {
         thinkingField.setText(Prefs.thinking(this));
         add(col, thinkingField, 0);
 
+        add(col, label("Reference file (optional). Attach your study material (PDF, text, Word, PowerPoint or "
+                + "image) and every question is answered from it, because small models are not reliable on their "
+                + "own. With no file attached the model answers from its own knowledge."), 20);
+        LinearLayout fileRow = new LinearLayout(this);
+        fileRow.setOrientation(LinearLayout.HORIZONTAL);
+        fileRow.addView(button("Attach file", v -> pickFile()),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        fileRow.addView(button("Remove file", v -> removeFile()),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        add(col, fileRow, 4);
+        add(col, button("Check the file with Gemini (uses 1 request)", v -> checkFile()), 4);
+        referenceStatus = new TextView(this);
+        referenceStatus.setTextIsSelectable(true);
+        add(col, referenceStatus, 4);
+        showReference();
+
         activeSwitch = new Switch(this);
         activeSwitch.setText("Volume Down runs the solver");
         activeSwitch.setChecked(Prefs.active(this));
@@ -109,6 +134,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        refreshStatus();
+    }
+
+    /** Service on/off line and the unread-errors counter on the log button. */
+    private void refreshStatus() {
         status.setText(isServiceEnabled()
                 ? "Accessibility service: ON"
                 : "Accessibility service: OFF - turn on \"Volume Solver\" in Accessibility settings");
@@ -153,6 +183,7 @@ public class MainActivity extends Activity {
                     out += "\nNot used:\n" + r.notes;
                 }
                 Logs.i(ctx, "Test", "API key test OK. " + out);
+
             } catch (Throwable t) {
                 Logs.e(ctx, "Test", "API key test failed for model " + model, t);
                 out = "Failed (full details in the log): " + shorten(t);
@@ -160,6 +191,126 @@ public class MainActivity extends Activity {
             final String text = out;
             runOnUiThread(() -> testOutput.setText(text));
         }).start();
+    }
+
+    private static String checkAttachedFile(Context ctx, String key, String model, Reference.Info attached) {
+        try {
+            GeminiClient.Reply r = GeminiClient.checkReference(ctx, key, model);
+            Logs.i(ctx, "Test", "Reference file check OK. " + r.model + " read " + attached.describe()
+                    + " and quoted: " + r.text);
+            return "File check OK. " + r.model + " read " + attached.name + " and quoted: " + r.text;
+        } catch (Throwable t) {
+            Logs.e(ctx, "Test", "Reference file check failed for " + attached.describe(), t);
+            return "File check failed (full details in the log): " + shorten(t);
+        }
+    }
+
+    private void showReference() {
+        Reference.Info info = Reference.info(this);
+        referenceStatus.setText(info == null
+                ? "No file attached: questions are answered from the model's own knowledge."
+                : "Attached: " + info.describe());
+    }
+
+    /** Sends the attached file with a tiny question, so a problem with it shows up now and not during the exam. */
+    private void checkFile() {
+        save();
+        final Context ctx = getApplicationContext();
+        final Reference.Info attached = Reference.info(ctx);
+        final String key = Prefs.apiKey(ctx);
+        final String model = Prefs.model(ctx);
+        if (attached == null) {
+            referenceStatus.setText("Attach a file first.");
+            return;
+        }
+        if (key.isEmpty()) {
+            referenceStatus.setText("Attached: " + attached.describe() + "\nPaste your API key first.");
+            return;
+        }
+        referenceStatus.setText("Attached: " + attached.describe() + "\nChecking with Gemini...");
+        new Thread(() -> {
+            final String result = checkAttachedFile(ctx, key, model, attached);
+            runOnUiThread(() -> {
+                referenceStatus.setText("Attached: " + attached.describe() + "\n" + result);
+                refreshStatus();
+            });
+        }).start();
+    }
+
+    private void pickFile() {
+        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        pick.addCategory(Intent.CATEGORY_OPENABLE);
+        pick.setType("*/*");
+        try {
+            startActivityForResult(pick, REQUEST_PICK_FILE);
+        } catch (Throwable t) {
+            Logs.e(this, "Reference", "Could not open the file picker", t);
+            referenceStatus.setText("Could not open the file picker (details in the log): " + shorten(t));
+        }
+    }
+
+    private void removeFile() {
+        Reference.remove(this);
+        showReference();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_PICK_FILE || resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        final Uri uri = data.getData();
+        final Context ctx = getApplicationContext();
+        referenceStatus.setText("Reading the file...");
+        new Thread(() -> {
+            String out;
+            try {
+                out = "Attached: " + readAndAttach(ctx, uri).describe();
+            } catch (Throwable t) {
+                Logs.e(ctx, "Reference", "Could not attach the file", t);
+                out = "Could not attach the file (full details in the log): " + shorten(t);
+            }
+            final String text = out;
+            runOnUiThread(() -> {
+                referenceStatus.setText(text);
+                refreshStatus(); // the unread-errors counter on the log button may have changed
+            });
+        }).start();
+    }
+
+    private static Reference.Info readAndAttach(Context ctx, Uri uri) throws IOException {
+        ContentResolver cr = ctx.getContentResolver();
+        String name = null;
+        long size = -1;
+        try (Cursor cursor = cr.query(uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE},
+                null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (nameColumn >= 0 && !cursor.isNull(nameColumn)) {
+                    name = cursor.getString(nameColumn);
+                }
+                int sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE);
+                if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) {
+                    size = cursor.getLong(sizeColumn);
+                }
+            }
+        }
+        if (name == null) {
+            name = uri.getLastPathSegment();
+        }
+        if (size > Reference.MAX_FILE_BYTES) {
+            throw new IOException("The file is " + Reference.readableSize(size) + ", which is more than this app "
+                    + "reads (" + Reference.readableSize(Reference.MAX_FILE_BYTES) + ").");
+        }
+        byte[] data;
+        try (InputStream in = cr.openInputStream(uri)) {
+            if (in == null) {
+                throw new IOException("The file could not be opened.");
+            }
+            data = Reference.readLimited(in, Reference.MAX_FILE_BYTES);
+        }
+        return Reference.attach(ctx, name, cr.getType(uri), data);
     }
 
     private void openAppInfo() {

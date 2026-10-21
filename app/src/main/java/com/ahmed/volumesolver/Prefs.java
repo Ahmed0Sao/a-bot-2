@@ -21,6 +21,11 @@ final class Prefs {
         return c.getApplicationContext().getSharedPreferences("volume_solver", Context.MODE_PRIVATE);
     }
 
+    /** The raw settings store, for classes that keep their own keys (see {@link Reference}). */
+    static SharedPreferences store(Context c) {
+        return sp(c);
+    }
+
     static String apiKey(Context c) {
         return sp(c).getString("api_key", "").trim();
     }
