@@ -168,13 +168,7 @@ final class GeminiClient {
         String reply = r.text;
         Logs.i(ctx, TAG, "Raw reply from " + r.model + ": " + reply);
 
-        String trimmed = reply.trim();
-        int start = trimmed.indexOf('{');
-        int end = trimmed.lastIndexOf('}');
-        if (start < 0 || end <= start) {
-            throw new IOException("Reply from " + r.model + " is not JSON: " + reply);
-        }
-        JSONObject json = new JSONObject(trimmed.substring(start, end + 1));
+        JSONObject json = parseReply(ctx, r.model, reply);
 
         Answer a = new Answer();
         a.raw = reply;
@@ -197,6 +191,102 @@ final class GeminiClient {
             throw new IOException("Reply from " + r.model + " has no usable box_2d: " + reply);
         }
         return a;
+    }
+
+    /** The model's reply as JSON. Takes the part between the first { and the last }. */
+    private static JSONObject parseReply(Context ctx, String model, String reply) throws IOException, JSONException {
+        String trimmed = reply.trim();
+        int start = trimmed.indexOf('{');
+        int end = trimmed.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            throw new IOException("Reply from " + model + " is not JSON: " + reply);
+        }
+        String body = trimmed.substring(start, end + 1);
+        try {
+            return new JSONObject(body);
+        } catch (JSONException e) {
+            // Small models sometimes put unescaped quotes into the quoted evidence. The answer and the box are what
+            // matters, so take them out of the text directly.
+            JSONObject rescued = rescue(body);
+            if (rescued == null) {
+                throw new IOException("Reply from " + model + " is not valid JSON (" + e.getMessage() + "): " + reply);
+            }
+            Logs.i(ctx, TAG, "The reply from " + model + " is not valid JSON (" + e.getMessage()
+                    + "); its answer and box were taken from the text anyway.");
+            return rescued;
+        }
+    }
+
+    private static final Pattern FOUND = Pattern.compile("\"found\"\\s*:\\s*(true|false)");
+    private static final Pattern ANSWER = Pattern.compile("\"answer\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"",
+            Pattern.DOTALL);
+    private static final Pattern EVIDENCE = Pattern.compile("\"evidence\"\\s*:\\s*\"(.*?)\"\\s*,\\s*\"answer\"",
+            Pattern.DOTALL);
+    private static final Pattern BOX = Pattern.compile("\"box_2d\"\\s*:\\s*\\[\\s*(-?[0-9.]+)\\s*,\\s*(-?[0-9.]+)\\s*,"
+            + "\\s*(-?[0-9.]+)\\s*,\\s*(-?[0-9.]+)\\s*\\]");
+
+    /** Null if the text has no usable answer and box. */
+    private static JSONObject rescue(String body) throws JSONException {
+        Matcher f = FOUND.matcher(body);
+        boolean found = !f.find() || f.group(1).equals("true");
+        JSONObject out = new JSONObject().put("found", found);
+        Matcher a = ANSWER.matcher(body);
+        boolean hasAnswer = a.find();
+        if (hasAnswer) {
+            out.put("answer", unescape(a.group(1)));
+        }
+        Matcher e = EVIDENCE.matcher(body);
+        if (e.find()) {
+            out.put("evidence", unescape(e.group(1)));
+        }
+        Matcher b = BOX.matcher(body);
+        boolean hasBox = b.find();
+        if (hasBox) {
+            JSONArray box = new JSONArray();
+            try {
+                for (int i = 1; i <= 4; i++) {
+                    box.put(Double.valueOf(Double.parseDouble(b.group(i))));
+                }
+            } catch (NumberFormatException bad) {
+                hasBox = false;
+            }
+            out.put("box_2d", box);
+        }
+        return !found || (hasAnswer && hasBox) ? out : null;
+    }
+
+    private static String unescape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch != '\\' || i + 1 >= s.length()) {
+                sb.append(ch);
+                continue;
+            }
+            char next = s.charAt(++i);
+            if (next == 'n') {
+                sb.append('\n');
+            } else if (next == 't') {
+                sb.append('\t');
+            } else if (next == 'r') {
+                sb.append('\r');
+            } else if (next == 'u' && isHex(s, i + 1)) {
+                sb.append((char) Integer.parseInt(s.substring(i + 1, i + 5), 16));
+                i += 4;
+            } else {
+                sb.append(next);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static boolean isHex(String s, int from) {
+        for (int i = from; i < from + 4; i++) {
+            if (i >= s.length() || Character.digit(s.charAt(i), 16) < 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
