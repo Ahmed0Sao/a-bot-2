@@ -33,6 +33,7 @@ public class SolverService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         Logs.i(this, TAG, "Service connected. model=" + Prefs.model(this)
+                + ", fallbacks=[" + Prefs.fallbacks(this) + "]"
                 + ", active=" + Prefs.active(this)
                 + ", API key " + (Prefs.apiKey(this).isEmpty() ? "NOT set" : "set"));
     }
@@ -138,7 +139,7 @@ public class SolverService extends AccessibilityService {
             }
             final float x = clamp((float) ((xMin + xMax) / 2000.0 * w), 1f, w - 1f);
             final float y = clamp((float) ((yMin + yMax) / 2000.0 * h), 1f, h - 1f);
-            Logs.i(this, TAG, "Answer \"" + answer.text + "\" box_2d=[" + yMin + ", " + xMin + ", " + yMax + ", "
+            Logs.i(this, TAG, "Answer \"" + answer.text + "\" from " + answer.model + " box_2d=[" + yMin + ", " + xMin + ", " + yMax + ", "
                     + xMax + "] -> tap at (" + Math.round(x) + ", " + Math.round(y) + ") on " + w + "x" + h);
             main.post(() -> tap(x, y));
         } catch (Throwable t) {

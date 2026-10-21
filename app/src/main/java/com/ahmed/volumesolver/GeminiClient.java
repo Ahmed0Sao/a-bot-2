@@ -15,10 +15,25 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
 import java.util.Locale;
+import java.util.TimeZone;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Minimal Gemini REST client with two routes:
+ * Minimal Gemini REST client.
+ * <p>
+ * Models: the main model is tried first. When it has used up its quota (or is overloaded, or does not exist for
+ * this key) the next model of the fallback list is tried, and so on. Free-tier quotas are counted per model, so
+ * every extra model adds its own daily allowance. A model whose daily quota is used up is skipped until the quota
+ * resets (midnight Pacific time) so the next key press does not waste a request on it.
+ * <p>
+ * Routes (per model):
  * <ul>
  * <li>"interactions": POST /v1beta/interactions, Google's current API. Its key documentation uses this route.</li>
  * <li>"generateContent": POST /v1beta/models/{model}:generateContent, the older route that is still supported.</li>
@@ -33,10 +48,26 @@ final class GeminiClient {
         boolean found;
         String text = "";
         String raw = "";
+        /** The model that produced the answer (can be a fallback). */
+        String model = "";
         double yMin;
         double xMin;
         double yMax;
         double xMax;
+    }
+
+    /** Text produced by one model. */
+    static final class Reply {
+        final String text;
+        final String model;
+        /** Models that were tried or skipped before this one, one line each; empty if the first model answered. */
+        final String notes;
+
+        Reply(String text, String model, String notes) {
+            this.text = text;
+            this.model = model;
+            this.notes = notes;
+        }
     }
 
     /** HTTP error from the API. Keeps the status code and body so the caller can decide what to try next. */
@@ -58,6 +89,13 @@ final class GeminiClient {
     private static final String TAG = "Gemini";
     private static final String API_ROOT = "https://generativelanguage.googleapis.com/v1beta/";
     private static final int MAX_LOGGED_BODY = 8000;
+    private static final long MODEL_MISSING_SKIP_MS = 30 * 60 * 1000L;
+    private static final long UNKNOWN_RATE_LIMIT_SKIP_MS = 60 * 1000L;
+    private static final long MAX_RATE_LIMIT_SKIP_MS = 120 * 1000L;
+
+    /** "retryDelay": "49s" in the error details, or "Please retry in 49.0s" in the message. */
+    private static final Pattern RETRY_DELAY =
+            Pattern.compile("retry(?:delay\"\\s*:\\s*\"|\\s+in\\s+)(\\d+(?:\\.\\d+)?)s", Pattern.CASE_INSENSITIVE);
 
     private static final String PROMPT =
             "This is a screenshot of a phone that shows a question with several selectable answer options. "
@@ -75,19 +113,21 @@ final class GeminiClient {
 
     static Answer solve(Context ctx, String apiKey, String model, byte[] jpeg) throws IOException, JSONException {
         String image = Base64.encodeToString(jpeg, Base64.NO_WRAP);
-        String reply = generate(ctx, apiKey, model, PROMPT, image, true);
-        Logs.i(ctx, TAG, "Raw reply: " + reply);
+        Reply r = generate(ctx, apiKey, model, PROMPT, image, true, false);
+        String reply = r.text;
+        Logs.i(ctx, TAG, "Raw reply from " + r.model + ": " + reply);
 
         String trimmed = reply.trim();
         int start = trimmed.indexOf('{');
         int end = trimmed.lastIndexOf('}');
         if (start < 0 || end <= start) {
-            throw new IOException("Reply is not JSON: " + reply);
+            throw new IOException("Reply from " + r.model + " is not JSON: " + reply);
         }
         JSONObject json = new JSONObject(trimmed.substring(start, end + 1));
 
         Answer a = new Answer();
         a.raw = reply;
+        a.model = r.model;
         a.found = json.optBoolean("found", true);
         a.text = json.optString("answer", "");
         JSONArray box = json.optJSONArray("box_2d");
@@ -98,22 +138,183 @@ final class GeminiClient {
             a.xMax = box.optDouble(3, 0);
         }
         if (a.found && !(a.xMax > a.xMin && a.yMax > a.yMin)) {
-            throw new IOException("Reply has no usable box_2d: " + reply);
+            throw new IOException("Reply from " + r.model + " has no usable box_2d: " + reply);
         }
         return a;
     }
 
-    /** Tiny text-only request used by the "Test API key" button. */
-    static String ping(Context ctx, String apiKey, String model) throws IOException, JSONException {
-        return generate(ctx, apiKey, model, "Reply with the single word OK.", null, false).trim();
+    /**
+     * Tiny text-only request used by the "Test API key" button. It ignores the "out of quota" memory so the test
+     * always shows the current state, and it refreshes that memory.
+     */
+    static Reply ping(Context ctx, String apiKey, String model) throws IOException, JSONException {
+        Reply r = generate(ctx, apiKey, model, "Reply with the single word OK.", null, false, true);
+        return new Reply(r.text.trim(), r.model, r.notes);
     }
 
-    // ---------------------------------------------------------------- route selection
+    /** The main model first, then the fallbacks, without duplicates. Fallbacks may be separated by , ; space or newline. */
+    static List<String> modelChain(String primary, String fallbacks) {
+        List<String> chain = new ArrayList<>();
+        addModel(chain, primary);
+        for (String m : fallbacks.split("[,;\\s]+")) {
+            addModel(chain, m);
+        }
+        return chain;
+    }
 
-    /** Sends the prompt (and optional JPEG as base64) and returns the model's text. */
-    private static String generate(Context ctx, String apiKey, String model, String prompt, String image,
-                                   boolean json) throws IOException, JSONException {
-        String name = model.startsWith("models/") ? model.substring("models/".length()) : model;
+    private static void addModel(List<String> chain, String raw) {
+        String m = raw.trim();
+        if (m.startsWith("models/")) {
+            m = m.substring("models/".length());
+        }
+        if (!m.isEmpty() && !chain.contains(m)) {
+            chain.add(m);
+        }
+    }
+
+    // ---------------------------------------------------------------- model selection
+
+    private static Reply generate(Context ctx, String apiKey, String primary, String prompt, String image,
+                                  boolean json, boolean ignoreSkips) throws IOException, JSONException {
+        List<String> chain = modelChain(primary, Prefs.fallbacks(ctx));
+        long now = System.currentTimeMillis();
+
+        // Models that ran out of quota are skipped until it resets, unless that would leave nothing to try.
+        boolean useSkips = !ignoreSkips;
+        if (useSkips) {
+            boolean anyUsable = false;
+            for (String m : chain) {
+                if (Prefs.skipUntil(ctx, m) <= now) {
+                    anyUsable = true;
+                }
+            }
+            if (!anyUsable) {
+                Logs.i(ctx, TAG, "Every model in the list is marked as unavailable right now; trying them again.");
+                useSkips = false;
+            }
+        }
+
+        List<String> notes = new ArrayList<>();
+        ApiException last = null;
+        for (int i = 0; i < chain.size(); i++) {
+            String m = chain.get(i);
+            long until = Prefs.skipUntil(ctx, m);
+            if (useSkips && until > now) {
+                Logs.i(ctx, TAG, "Skipping " + m + " until " + stamp(until)
+                        + " (an earlier error marked it as unavailable).");
+                notes.add(m + ": skipped until " + stamp(until));
+                continue;
+            }
+            try {
+                String text = generateWith(ctx, apiKey, m, prompt, image, json);
+                if (until > 0) {
+                    Prefs.clearSkip(ctx, m);
+                }
+                if (i > 0) {
+                    Logs.i(ctx, TAG, "Answered by fallback model " + m + " (main model: " + chain.get(0) + ").");
+                }
+                return new Reply(text, m, join(notes));
+            } catch (ApiException e) {
+                String why = moveOnReason(ctx, m, e);
+                if (why == null) {
+                    throw e;
+                }
+                boolean more = i < chain.size() - 1;
+                Logs.i(ctx, TAG, m + " cannot answer: " + why + (more ? ". Trying the next model." : ".")
+                        + "\n" + e.getMessage());
+                notes.add(m + ": " + why);
+                last = e;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder("No model could answer. Tried in this order:");
+        for (String n : notes) {
+            sb.append("\n- ").append(n);
+        }
+        if (last != null) {
+            sb.append("\n\nLast error in full:\n").append(last.getMessage());
+        }
+        throw new IOException(sb.toString());
+    }
+
+    /**
+     * Why the next model should be tried after this error, or null when the error is not about this model (bad
+     * key, bad request ...) and trying other models would only repeat it. Also remembers for how long this model
+     * should be skipped.
+     */
+    private static String moveOnReason(Context ctx, String model, ApiException e) {
+        long now = System.currentTimeMillis();
+        String b = e.body.toLowerCase(Locale.ROOT);
+        if (e.code == 429) {
+            if (b.contains("perday") || b.contains("per_day") || b.contains("per day") || b.contains("limit: 0")) {
+                long until = nextPacificMidnight(now);
+                Prefs.setSkipUntil(ctx, model, until);
+                return "daily quota used up (HTTP 429), skipped until " + stamp(until);
+            }
+            long wait = retryDelayMs(e.body);
+            long ms = wait > 0 ? Math.min(wait + 1000, MAX_RATE_LIMIT_SKIP_MS) : UNKNOWN_RATE_LIMIT_SKIP_MS;
+            Prefs.setSkipUntil(ctx, model, now + ms);
+            return "rate limit reached (HTTP 429), skipped for " + Math.round(ms / 1000.0) + " s";
+        }
+        if (e.code >= 500) {
+            return "server error (HTTP " + e.code + ")";
+        }
+        if (e.code == 404 || (e.code == 400 && mentionsMissingModel(b))) {
+            Prefs.setSkipUntil(ctx, model, now + MODEL_MISSING_SKIP_MS);
+            return "model not available for this key (HTTP " + e.code + "), skipped for 30 min";
+        }
+        return null;
+    }
+
+    private static boolean mentionsMissingModel(String lowerBody) {
+        return lowerBody.contains("model") && (lowerBody.contains("not found") || lowerBody.contains("not supported")
+                || lowerBody.contains("does not exist") || lowerBody.contains("is not available"));
+    }
+
+    private static long retryDelayMs(String body) {
+        Matcher m = RETRY_DELAY.matcher(body);
+        if (m.find()) {
+            try {
+                return Math.round(Double.parseDouble(m.group(1)) * 1000);
+            } catch (NumberFormatException ignored) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    /** Free-tier daily quotas reset at midnight Pacific time. */
+    private static long nextPacificMidnight(long now) {
+        Calendar c = Calendar.getInstance(TimeZone.getTimeZone("America/Los_Angeles"));
+        c.setTimeInMillis(now);
+        c.set(Calendar.HOUR_OF_DAY, 0);
+        c.set(Calendar.MINUTE, 0);
+        c.set(Calendar.SECOND, 0);
+        c.set(Calendar.MILLISECOND, 0);
+        c.add(Calendar.DAY_OF_MONTH, 1);
+        return c.getTimeInMillis();
+    }
+
+    private static String stamp(long millis) {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(new Date(millis)) + " (device time)";
+    }
+
+    private static String join(List<String> lines) {
+        StringBuilder sb = new StringBuilder();
+        for (String line : lines) {
+            if (sb.length() > 0) {
+                sb.append('\n');
+            }
+            sb.append(line);
+        }
+        return sb.toString();
+    }
+
+    // ---------------------------------------------------------------- route selection (one model)
+
+    /** Sends the prompt (and optional JPEG as base64) to one model and returns its text. */
+    private static String generateWith(Context ctx, String apiKey, String name, String prompt, String image,
+                                       boolean json) throws IOException, JSONException {
         String thinking = Prefs.thinking(ctx);
 
         String known = Prefs.route(ctx);
@@ -127,21 +328,34 @@ final class GeminiClient {
             remember(ctx, first);
             return reply;
         } catch (ApiException e) {
+            if (e.code == 429) {
+                remember(ctx, first); // the key was accepted on this route, only the quota is used up
+            }
             if (!routeMayBeWrong(e.code)) {
                 throw e;
             }
             firstError = e;
         }
 
-        Logs.i(ctx, TAG, "The " + first + " route was rejected, trying the " + second
+        Logs.i(ctx, TAG, "The " + first + " route was rejected for " + name + ", trying the " + second
                 + " route instead. First error:\n" + firstError.getMessage());
         try {
             String reply = viaRoute(ctx, second, apiKey, name, prompt, image, json, thinking);
             remember(ctx, second);
             return reply;
         } catch (ApiException e) {
-            throw new IOException("Both API routes failed.\n\n--- " + first + " route ---\n"
-                    + firstError.getMessage() + "\n\n--- " + second + " route ---\n" + e.getMessage());
+            if (e.code == 429) {
+                remember(ctx, second);
+            }
+            // The status that decides what happens next. A quota or server error from the second route proves the
+            // key and model are accepted there, so it wins. Otherwise a 404 on either route usually means this
+            // model name is not available for the key.
+            boolean keyProblem = isKeyProblem(firstError.body) || isKeyProblem(e.body);
+            int code = e.code == 429 || e.code >= 500 ? e.code
+                    : (firstError.code == 404 || e.code == 404) && !keyProblem ? 404 : e.code;
+            throw new ApiException(code, "Both API routes failed for " + name + ".\n\n--- " + first
+                    + " route ---\n" + firstError.getMessage() + "\n\n--- " + second + " route ---\n"
+                    + e.getMessage(), firstError.body + "\n" + e.body);
         }
     }
 
@@ -273,7 +487,9 @@ final class GeminiClient {
                 lastError = new ApiException(code, "Gemini returned HTTP " + code
                         + (reason == null || reason.isEmpty() ? "" : " " + reason)
                         + " (" + route + " route)\n" + cap(responseBody), responseBody);
-                boolean retryable = code == 429 || code >= 500;
+                // A used-up quota will not be back in 1.5 s: the next model is the better answer to that.
+                boolean quota = code == 429 && responseBody.toLowerCase(Locale.ROOT).contains("quota");
+                boolean retryable = code >= 500 || (code == 429 && !quota);
                 if (!retryable || attempt == 2) {
                     throw lastError;
                 }

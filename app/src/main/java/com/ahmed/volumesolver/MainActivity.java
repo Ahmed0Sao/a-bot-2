@@ -23,6 +23,7 @@ public class MainActivity extends Activity {
     private TextView testOutput;
     private EditText keyField;
     private EditText modelField;
+    private EditText fallbackField;
     private EditText thinkingField;
     private Switch activeSwitch;
     private Button logButton;
@@ -72,6 +73,14 @@ public class MainActivity extends Activity {
         modelField.setText(Prefs.model(this));
         add(col, modelField, 0);
 
+        add(col, label("Fallback models, tried in this order when the model above has used up its free quota "
+                + "(separate with commas; empty = none)"), 12);
+        fallbackField = new EditText(this);
+        fallbackField.setMinLines(2);
+        fallbackField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        fallbackField.setText(Prefs.fallbacks(this));
+        add(col, fallbackField, 0);
+
         add(col, label("Thinking level (optional: minimal, low, medium or high; empty = model default)"), 12);
         thinkingField = new EditText(this);
         thinkingField.setSingleLine(true);
@@ -119,6 +128,7 @@ public class MainActivity extends Activity {
         Prefs.save(this,
                 keyField.getText().toString(),
                 modelField.getText().toString(),
+                fallbackField.getText().toString(),
                 thinkingField.getText().toString(),
                 activeSwitch.isChecked());
     }
@@ -136,10 +146,13 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             String out;
             try {
-                String reply = GeminiClient.ping(ctx, key, model);
+                GeminiClient.Reply r = GeminiClient.ping(ctx, key, model);
                 String route = Prefs.route(ctx);
-                Logs.i(ctx, "Test", "API key test OK. " + model + " replied: " + reply + " (route: " + route + ")");
-                out = "OK. " + model + " replied: " + reply + " (route: " + route + ")";
+                out = "OK. " + r.model + " replied: " + r.text + " (route: " + route + ")";
+                if (!r.notes.isEmpty()) {
+                    out += "\nNot used:\n" + r.notes;
+                }
+                Logs.i(ctx, "Test", "API key test OK. " + out);
             } catch (Throwable t) {
                 Logs.e(ctx, "Test", "API key test failed for model " + model, t);
                 out = "Failed (full details in the log): " + shorten(t);

@@ -35,7 +35,17 @@ If both routes fail, the log shows both error messages. Typical causes:
 
 - HTTP 401 or 403 on both: the key is not accepted. Create a new key in AI Studio and paste it, or use a standard key that is restricted to the Gemini API.
 - HTTP 404 mentioning the model: the model name is wrong or not available to your key. The model field is editable.
-- HTTP 429: the free quota is used up for now. Wait, or check the limits in AI Studio.
+- HTTP 429: the free quota of that model is used up. The app then moves on to the next model of the fallback list (see below). The exact limits of each model are in AI Studio (aistudio.google.com/rate-limit).
+
+## Free quota and fallback models
+
+Free-tier limits are counted per model, so a model that has used up its daily requests does not affect the others. The app has a "Fallback models" list under the Model field. When the main model answers HTTP 429 (quota), is overloaded (5xx), or does not exist for your key (404), the next model of the list is tried automatically. The default list contains the models that Google's pricing page marks as free of charge: gemini-3.6-flash, gemini-3-flash-preview, gemini-3.5-flash-lite, gemini-3.1-flash-lite. You can edit it (comma separated, empty = no fallback).
+
+- A model whose daily quota is used up is skipped until the quota resets (midnight Pacific time) so the next key press does not waste time on it. Short rate limits (per minute) are skipped for the delay Google reports.
+- A wrong API key or a malformed request does not move on to other models, because they would fail the same way. The log shows the exact error.
+- The log says which model answered and why the others were skipped. Test API key shows the same.
+- If every model is used up the log lists them all with the reason, and the last HTTP response in full.
+- Quotas change over time. Check what each model currently allows at aistudio.google.com/rate-limit. Linking a billing account to the project (Tier 1) removes the free-tier daily caps.
 
 ## Log
 
@@ -47,4 +57,4 @@ Screenshots are sent to Google's Gemini API with your own key (on the Interactio
 
 The API key is saved only on the phone, inside the app. It is not part of this project.
 
-The model name is editable in the app (default gemini-3.8-flash). Thinking level is optional: leave it empty for the model default, or try low (or minimal) for faster answers. If the API rejects the value, the app retries once without it and the log shows what Google said.
+The model name is editable in the app (default gemini-3.8-flash; the fallback list is described above). Thinking level is optional: leave it empty for the model default, or try low (or minimal) for faster answers. If the API rejects the value, the app retries once without it and the log shows what Google said.
