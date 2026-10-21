@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Volume Solver</string>
+    <string name="service_description">When you press Volume Down, takes a screenshot, sends it to Google\'s Gemini API with your own key, and taps the answer Gemini picks. Volume Down no longer changes the volume while this is on.</string>
+</resources>

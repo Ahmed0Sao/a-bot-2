@@ -1,0 +1,76 @@
+name: Build APK
+
+on:
+  push:
+    branches-ignore:
+      - ci-output
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android platform 35
+        continue-on-error: true
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35"
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VolumeSolver-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "Volume Solver build ${{ github.run_number }}" \
+            --notes "Debug APK built from ${{ github.sha }}" \
+            --target "${{ github.sha }}"
+
+      # Keeps the newest APK (VolumeSolver.apk) and the Gradle log on a branch called ci-output,
+      # so both can be fetched with plain git or a raw link, and a failed build can be read without the Actions UI.
+      - name: Publish APK and build log to the ci-output branch
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/ci-output"
+          rm -rf "$out"
+          mkdir -p "$out"
+          if [ -f build.log ]; then
+            tail -c 700000 build.log > "$out/build.log"
+          else
+            echo "No build log: the build did not start." > "$out/build.log"
+          fi
+          if [ -f app/build/outputs/apk/debug/app-debug.apk ]; then
+            cp app/build/outputs/apk/debug/app-debug.apk "$out/VolumeSolver.apk"
+          fi
+          echo "run ${{ github.run_number }}, result ${{ job.status }}, commit ${{ github.sha }}" > "$out/STATUS.txt"
+          cd "$out"
+          git init -q
+          git checkout -q -b ci-output
+          git add -A
+          git -c user.name="github-actions" -c user.email="actions@users.noreply.github.com" \
+            commit -q -m "Build ${{ github.run_number }} (${{ job.status }})"
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-output
