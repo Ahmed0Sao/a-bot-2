@@ -1,6 +1,8 @@
-# Volume Solver
+# lower volume
 
-Press Volume Down -> the app screenshots the screen -> Gemini picks the correct answer option -> the app taps it.
+Press Volume Down, or tap the screen several times quickly -> the app screenshots the screen -> Gemini picks the correct answer option -> the app taps it.
+
+The app is called "lower volume" on the phone (it used to be "Volume Solver"). Only the name changed: the package stays com.ahmed.volumesolver, so the new APK installs over the old one and keeps the API key, the settings and the accessibility permission.
 
 Nothing is shown on screen when you press the button. Progress and every error (exception, stack trace, raw API response) go to the Log screen inside the app (Copy all / Clear).
 
@@ -15,12 +17,26 @@ Every build is signed with the same key (app/debug.keystore), so a new APK insta
 ## Set up on the phone
 
 1. Install the APK (allow "install unknown apps" for the browser or file manager you used).
-2. Open Volume Solver, paste a Gemini API key (https://aistudio.google.com/apikey) and tap Test API key. The result shows which API route worked.
-3. Tap Open Accessibility settings, open Volume Solver and turn it on. If the switch is greyed out: App info > three-dot menu > Allow restricted settings, then try again.
-4. Samsung: Settings > Apps > Volume Solver > Battery > Unrestricted, so the service is not stopped in the background.
-5. Open a screen with a multiple-choice question and press Volume Down.
+2. Open lower volume, paste a Gemini API key (https://aistudio.google.com/apikey) and tap Test API key. The result shows which API route worked.
+3. Tap Open Accessibility settings, open lower volume and turn it on. If the switch is greyed out: App info > three-dot menu > Allow restricted settings, then try again.
+4. Samsung: Settings > Apps > lower volume > Battery > Unrestricted, so the service is not stopped in the background.
+5. Open a screen with a multiple-choice question and press Volume Down, or tap the screen 4 times quickly (see below).
 
 While the service is on, Volume Down does not change the volume. Switch "Volume Down runs the solver" off in the app to get the normal volume button back.
+
+## Tap trigger (tap the screen quickly)
+
+Tapping the screen several times in a row starts exactly what Volume Down starts. Setting "Tapping the screen quickly runs the solver" (on by default) and "Taps needed in a row" (default 4, range 3 to 10) are in the app. Each tap must come within 0.7 s of the one before, and the solver starts after a short pause (0.35 s) once the last tap is done.
+
+How it works and what it cannot do:
+
+- The service adds an invisible window of 1x1 pixel that is not drawn and does not take touches. Android tells it each time a finger comes down on another window (FLAG_WATCH_OUTSIDE_TOUCH). While the setting is off the window is not there.
+- **Android does not tell an app where you touched another app**: those touches arrive with the position 0,0 (this is a security rule in Android's input system). So the app cannot check that the taps are on the same spot. It counts quick taps instead, and ignores the series when the screen reports something that is not a plain series of taps: scrolling, typing, a long press, a click on a different button each time, or an open keyboard. Those reports come from the apps themselves, so an app or game that does not report them is not covered. If Android ever gives a position, taps more than 64 dp apart are treated as different places.
+- Tap on an empty part of the screen (the question text, the background). The app under your finger receives the taps as well: tapping an answer option 4 times selects it 4 times.
+- While a run is going on and for 1.5 s after it, taps are ignored (the answer tap that the app makes itself is not counted). While this app's own screens are open the trigger is off; 4 quick taps there only write a "Tap trigger test" line to the log, which is an easy way to check that taps are seen.
+- The log shows: `Tap trigger on: ...` when the service starts, `Tap trigger: the invisible window received its first touch ...` at the first touch on another app, `Tap trigger: 4 quick taps in 0.84 s (pauses between them: ...)` when a series starts the solver, and `Tap trigger: A series of N taps was dropped because ...` when a series was thrown away. If the first-touch line never appears after you touched another app, the phone does not deliver touches to the invisible window and the tap trigger cannot work on it (Volume Down still does).
+- To tell a series of taps from normal use, the service now has two more permissions in its configuration: it listens for scroll, click, long-press and typing events, and it may list the open windows (to see whether the keyboard is open). Screen text is never read, logged or stored; clicks are compared only as a number made from the button's class and label.
+- Every start costs one request of your free quota, so a false start is not free. If you notice false starts, raise the number of taps or switch the setting off.
 
 ## API keys and routes
 

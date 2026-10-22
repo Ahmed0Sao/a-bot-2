@@ -41,7 +41,9 @@ public class MainActivity extends Activity {
     private EditText fallbackField;
     private EditText thinkingField;
     private EditText waitField;
+    private EditText tapField;
     private Switch activeSwitch;
+    private Switch tapSwitch;
     private Button logButton;
 
     @Override
@@ -53,14 +55,15 @@ public class MainActivity extends Activity {
         col.setPadding(dp(20), dp(24), dp(20), dp(32));
 
         TextView title = new TextView(this);
-        title.setText("Volume Solver");
+        title.setText("lower volume");
         title.setTextSize(26);
         add(col, title, 0);
 
         TextView intro = new TextView(this);
-        intro.setText("Press Volume Down on a screen with a multiple-choice question. The app screenshots it, "
-                + "asks Gemini for the correct option and taps it. Nothing is shown on screen when you press "
-                + "the button; all progress and every error go to the log (button at the bottom).");
+        intro.setText("Press Volume Down, or tap the screen several times quickly, on a screen with a "
+                + "multiple-choice question. The app screenshots it, asks Gemini for the correct option and taps "
+                + "it. Nothing is shown on screen when you do; all progress and every error go to the log "
+                + "(button at the bottom).");
         add(col, intro, 8);
 
         status = new TextView(this);
@@ -142,6 +145,24 @@ public class MainActivity extends Activity {
         activeSwitch.setOnCheckedChangeListener((view, on) -> save());
         add(col, activeSwitch, 16);
 
+        tapSwitch = new Switch(this);
+        tapSwitch.setText("Tapping the screen quickly runs the solver");
+        tapSwitch.setChecked(Prefs.tapTrigger(this));
+        tapSwitch.setOnCheckedChangeListener((view, on) -> save());
+        add(col, tapSwitch, 12);
+
+        add(col, label("Taps needed in a row (" + Prefs.MIN_TAPS + " to " + Prefs.MAX_TAPS + "; each tap within "
+                + TapDetector.MAX_GAP_MS + " ms of the one before). Tap on an empty part of the screen: the app "
+                + "under your finger gets the taps too. Android does not tell apps where you touch other apps, so "
+                + "the spot cannot be checked. A series is ignored when the screen reports scrolling, typing, a long "
+                + "press or taps on different buttons, or when the keyboard is open. While this app is open, quick "
+                + "taps are only written to the log as a test."), 4);
+        tapField = new EditText(this);
+        tapField.setSingleLine(true);
+        tapField.setInputType(InputType.TYPE_CLASS_NUMBER);
+        tapField.setText(String.valueOf(Prefs.tapCount(this)));
+        add(col, tapField, 0);
+
         add(col, button("Test API key", v -> runTest()), 12);
         testOutput = new TextView(this);
         testOutput.setTextIsSelectable(true);
@@ -158,6 +179,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        App.screenOpened();
         refreshStatus();
     }
 
@@ -165,7 +187,7 @@ public class MainActivity extends Activity {
     private void refreshStatus() {
         status.setText(isServiceEnabled()
                 ? "Accessibility service: ON"
-                : "Accessibility service: OFF - turn on \"Volume Solver\" in Accessibility settings");
+                : "Accessibility service: OFF - turn on \"lower volume\" in Accessibility settings");
         int unread = Prefs.unreadErrors(this);
         logButton.setText(unread > 0
                 ? "Open log (" + unread + " new error" + (unread == 1 ? "" : "s") + ")"
@@ -175,6 +197,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         save();
+        App.screenClosed();
         super.onPause();
     }
 
@@ -186,6 +209,7 @@ public class MainActivity extends Activity {
                 thinkingField.getText().toString(),
                 activeSwitch.isChecked());
         Prefs.setWait(this, waitField.getText().toString());
+        Prefs.setTap(this, tapSwitch.isChecked(), tapField.getText().toString());
     }
 
     private void runTest() {

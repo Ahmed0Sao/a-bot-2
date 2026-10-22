@@ -55,6 +55,7 @@ public class LogActivity extends Activity implements Logs.Listener {
     @Override
     protected void onResume() {
         super.onResume();
+        App.screenOpened();
         Logs.setListener(this);
         Prefs.clearUnread(this);
         refresh();
@@ -63,6 +64,7 @@ public class LogActivity extends Activity implements Logs.Listener {
     @Override
     protected void onPause() {
         Logs.setListener(null);
+        App.screenClosed();
         super.onPause();
     }
 
@@ -88,7 +90,7 @@ public class LogActivity extends Activity implements Logs.Listener {
 
     private void copyAll() {
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        cm.setPrimaryClip(ClipData.newPlainText("Volume Solver log", Logs.read(this)));
+        cm.setPrimaryClip(ClipData.newPlainText("lower volume log", Logs.read(this)));
     }
 
     private Button button(String text, View.OnClickListener listener) {

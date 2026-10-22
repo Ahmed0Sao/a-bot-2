@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Volume Solver</string>
-    <string name="service_description">When you press Volume Down, takes a screenshot, sends it to Google\'s Gemini API with your own key, and taps the answer Gemini picks. Volume Down no longer changes the volume while this is on.</string>
+    <string name="app_name">lower volume</string>
+    <string name="service_description">When you press Volume Down, or tap the screen several times quickly, takes a screenshot, sends it to Google\'s Gemini API with your own key, and taps the answer Gemini picks. Volume Down no longer changes the volume while this is on. Screen events (scrolling, typing, clicks) and a list of the open windows are used only to tell a series of taps from normal use; screen text is never read or stored.</string>
 </resources>

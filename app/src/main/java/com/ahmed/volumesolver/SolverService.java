@@ -2,32 +2,52 @@ package com.ahmed.volumesolver;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Path;
+import android.graphics.PixelFormat;
 import android.hardware.HardwareBuffer;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.Display;
+import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.io.ByteArrayOutputStream;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Listens for Volume Down, screenshots the display, asks Gemini for the correct answer
- * and taps it. Nothing is ever shown on screen: all progress and errors go to {@link Logs}.
+ * Listens for Volume Down (and, when switched on, several quick taps on the screen), screenshots the display, asks
+ * Gemini for the correct answer and taps it. Nothing is ever shown on screen: all progress and errors go to
+ * {@link Logs}.
  */
 public class SolverService extends AccessibilityService {
 
     private static final String TAG = "Service";
 
+    /** Taps this far apart (in dp) count as "the same place" when Android reports positions (it does not for other apps). */
+    private static final float SAME_SPOT_DP = 64f;
+    /** After a run the tap trigger ignores touches for this long, so the answer tap itself is never counted. */
+    private static final long QUIET_AFTER_RUN_MS = 1500;
+
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean busy = new AtomicBoolean(false);
+    private volatile long quietUntil;
+
+    private TapDetector taps;
+    private View touchWatcher;
+    private boolean firstTouchLogged;
+    private SharedPreferences.OnSharedPreferenceChangeListener prefListener;
 
     @Override
     protected void onServiceConnected() {
@@ -36,12 +56,69 @@ public class SolverService extends AccessibilityService {
                 + ", fallbacks=[" + Prefs.fallbacks(this) + "]"
                 + ", reference files=" + Reference.describe(this)
                 + ", active=" + Prefs.active(this)
+                + ", tap trigger=" + (Prefs.tapTrigger(this) ? Prefs.tapCount(this) + " quick taps" : "off")
                 + ", API key " + (Prefs.apiKey(this).isEmpty() ? "NOT set" : "set"));
+        try {
+            taps = new TapDetector(SAME_SPOT_DP * getResources().getDisplayMetrics().density, Prefs.tapCount(this));
+            // The preference store keeps only a weak reference to the listener, so it is kept in a field.
+            prefListener = (prefs, key) -> {
+                if ("tap_trigger".equals(key)) {
+                    syncTouchWatcher();
+                }
+            };
+            Prefs.store(this).registerOnSharedPreferenceChangeListener(prefListener);
+            syncTouchWatcher();
+        } catch (Throwable t) {
+            Logs.e(this, TAG, "Could not set up the tap trigger. Volume Down still works.", t);
+        }
     }
 
+    /**
+     * Screen events that show a series of touches is not a plain series of taps (scrolling, typing, a long press) or
+     * that the taps hit different buttons. Nothing from the screen is read or stored.
+     */
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // not used
+        TapDetector detector = taps;
+        if (event == null || detector == null || detector.count() == 0) {
+            return;
+        }
+        try {
+            long when = event.getEventTime();
+            switch (event.getEventType()) {
+                case AccessibilityEvent.TYPE_VIEW_CLICKED:
+                    detector.onClick(when, elementId(event));
+                    break;
+                case AccessibilityEvent.TYPE_VIEW_LONG_CLICKED:
+                    detector.onLongPress(when);
+                    break;
+                case AccessibilityEvent.TYPE_VIEW_SCROLLED:
+                    detector.onScroll(when);
+                    break;
+                case AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED:
+                    detector.onTyping(when);
+                    break;
+                default:
+                    return;
+            }
+            logTapNote();
+        } catch (Throwable t) {
+            Logs.e(this, TAG, "Tap trigger: error while handling a screen event", t);
+        }
+    }
+
+    /** What was clicked, as a number: a hash of its class, description and text (never stored or logged). */
+    private static int elementId(AccessibilityEvent event) {
+        int id = 17;
+        id = 31 * id + String.valueOf(event.getClassName()).hashCode();
+        id = 31 * id + String.valueOf(event.getContentDescription()).hashCode();
+        List<CharSequence> text = event.getText();
+        if (text != null) {
+            for (CharSequence part : text) {
+                id = 31 * id + String.valueOf(part).hashCode();
+            }
+        }
+        return id;
     }
 
     @Override
@@ -51,6 +128,14 @@ public class SolverService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+        try {
+            if (prefListener != null) {
+                Prefs.store(this).unregisterOnSharedPreferenceChangeListener(prefListener);
+            }
+            removeTouchWatcher(true);
+        } catch (Throwable t) {
+            Logs.e(this, TAG, "Error while shutting the tap trigger down", t);
+        }
         worker.shutdownNow();
         Logs.i(this, TAG, "Service destroyed");
         super.onDestroy();
@@ -62,27 +147,204 @@ public class SolverService extends AccessibilityService {
             return false;
         }
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-            start();
+            start("Volume Down", "Volume Down pressed");
         }
         // Swallow both DOWN and UP so the system volume does not change.
         return true;
     }
 
+    // ---- tap trigger ----------------------------------------------------------------------------------------
+
+    /** Adds or removes the invisible overlay so that it matches the "tap trigger" setting. Main thread only. */
+    private void syncTouchWatcher() {
+        boolean wanted = Prefs.tapTrigger(this);
+        if (wanted && touchWatcher == null) {
+            addTouchWatcher();
+        } else if (!wanted && touchWatcher != null) {
+            removeTouchWatcher(false);
+            Logs.i(this, TAG, "Tap trigger switched off: the invisible window was removed.");
+        }
+    }
+
+    /**
+     * Adds a 1x1 pixel window that is not drawn and does not take touches, but is told when a finger comes down
+     * anywhere else on the screen (FLAG_WATCH_OUTSIDE_TOUCH). Android reports those touches without a position when
+     * they belong to another app, so only their timing is used.
+     */
+    private void addTouchWatcher() {
+        try {
+            WindowManager windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+            View view = new View(this);
+            view.setOnTouchListener((v, event) -> {
+                onScreenTouch(event);
+                return false;
+            });
+            WindowManager.LayoutParams params = new WindowManager.LayoutParams(1, 1,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                            | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+                    PixelFormat.TRANSLUCENT);
+            params.gravity = Gravity.TOP | Gravity.START;
+            params.setTitle("lower volume tap counter");
+            windowManager.addView(view, params);
+            touchWatcher = view;
+            firstTouchLogged = false;
+            Logs.i(this, TAG, "Tap trigger on: " + Prefs.tapCount(this) + " quick taps (each within "
+                    + TapDetector.MAX_GAP_MS + " ms of the one before) start the same routine as Volume Down. "
+                    + "An invisible 1x1 pixel window counts the touches. Android does not say where touches on other "
+                    + "apps are, so the spot is not checked; the first touch it sees is logged below.");
+        } catch (Throwable t) {
+            Logs.e(this, TAG, "Could not add the invisible window that counts taps. The tap trigger will not work "
+                    + "(Volume Down still does).", t);
+        }
+    }
+
+    /** @param shuttingDown true when the service is being stopped: the system may already have removed the window */
+    private void removeTouchWatcher(boolean shuttingDown) {
+        View view = touchWatcher;
+        touchWatcher = null;
+        main.removeCallbacks(settleCheck);
+        if (taps != null) {
+            taps.reset();
+        }
+        if (view == null) {
+            return;
+        }
+        try {
+            ((WindowManager) getSystemService(WINDOW_SERVICE)).removeView(view);
+        } catch (Throwable t) {
+            if (shuttingDown) {
+                Logs.i(this, TAG, "The invisible tap-counting window was already gone when the service stopped ("
+                        + t + ")");
+            } else {
+                Logs.e(this, TAG, "Could not remove the invisible tap-counting window", t);
+            }
+        }
+    }
+
+    /** A finger came down somewhere else on the screen (called on the main thread by the invisible window). */
+    private void onScreenTouch(MotionEvent event) {
+        try {
+            if (event.getActionMasked() != MotionEvent.ACTION_OUTSIDE) {
+                return;
+            }
+            boolean ownScreen = App.screensOpen() > 0;
+            float x = event.getRawX();
+            float y = event.getRawY();
+            if (!firstTouchLogged && !ownScreen) {
+                firstTouchLogged = true;
+                boolean hidden = x == 0f && y == 0f;
+                Logs.i(this, TAG, "Tap trigger: the invisible window received its first touch (position reported: x="
+                        + x + ", y=" + y + "). " + (hidden
+                        ? "Android hides where you touch other apps, so only the timing of the taps is used."
+                        : "Android gave a position, so taps more than " + SAME_SPOT_DP + " dp apart count as "
+                        + "different places."));
+            }
+            TapDetector detector = taps;
+            long now = SystemClock.uptimeMillis();
+            if (detector == null || !Prefs.tapTrigger(this) || busy.get() || now < quietUntil) {
+                return;
+            }
+            detector.setNeeded(Prefs.tapCount(this));
+            detector.onTap(event.getEventTime(), x, y);
+            logTapNote();
+            long wait = detector.waitMs(now);
+            if (wait > 0) {
+                main.removeCallbacks(settleCheck);
+                main.postDelayed(settleCheck, wait);
+            }
+        } catch (Throwable t) {
+            Logs.e(this, TAG, "Tap trigger: error while counting a touch", t);
+        }
+    }
+
+    /** Runs when the taps have been quiet for a moment: starts the solver if they make a complete series. */
+    private final Runnable settleCheck = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                TapDetector detector = taps;
+                if (detector == null) {
+                    return;
+                }
+                long now = SystemClock.uptimeMillis();
+                TapDetector.Series series = detector.take(now);
+                if (series == null) {
+                    long wait = detector.waitMs(now);
+                    if (wait > 0) {
+                        main.postDelayed(this, wait);
+                    }
+                    return;
+                }
+                if (!Prefs.tapTrigger(SolverService.this) || busy.get()) {
+                    return;
+                }
+                if (App.screensOpen() > 0) {
+                    Logs.i(SolverService.this, TAG, "Tap trigger test: " + series.describe() + " were seen on this "
+                            + "app's own screen, so nothing was started (the trigger is off while this app is open).");
+                    return;
+                }
+                if (keyboardShowing()) {
+                    Logs.i(SolverService.this, TAG, "Tap trigger ignored: " + series.describe() + " were seen but "
+                            + "the keyboard is open, and typing looks like tapping. Close the keyboard and tap again.");
+                    return;
+                }
+                start("Tap trigger", "Tap trigger: " + series.describe() + ". Starting the same routine as "
+                        + "Volume Down.");
+            } catch (Throwable t) {
+                Logs.e(SolverService.this, TAG, "Tap trigger: error while starting the solver", t);
+            }
+        }
+    };
+
+    private void logTapNote() {
+        TapDetector detector = taps;
+        String note = detector == null ? null : detector.takeNote();
+        if (note != null) {
+            Logs.i(this, TAG, "Tap trigger: " + note);
+        }
+    }
+
+    private boolean keyboardShowing() {
+        try {
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo window : windows) {
+                    if (window.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Logs.e(this, TAG, "Could not check whether the keyboard is open (the tap trigger goes ahead)", t);
+        }
+        return false;
+    }
+
+    // ---- solver ---------------------------------------------------------------------------------------------
+
     /** One key press can spend up to 140 s on models; after that the busy flag is assumed to be stuck. */
     private static final long STUCK_AFTER_MS = 150000;
     private volatile long busySince;
 
-    private void start() {
+    /**
+     * Starts one run: screenshot, model, tap.
+     *
+     * @param name    what started it, for the "ignored" message
+     * @param started the log line that says it started
+     */
+    private void start(String name, String started) {
         if (!busy.compareAndSet(false, true)) {
             long age = SystemClock.elapsedRealtime() - busySince;
             if (age < STUCK_AFTER_MS) {
-                Logs.i(this, TAG, "Volume Down ignored: previous request is still running (" + age + " ms)");
+                Logs.i(this, TAG, name + " ignored: previous request is still running (" + age + " ms)");
                 return;
             }
             Logs.e(this, TAG, "The previous request never finished (" + age + " ms); starting a new one", null);
         }
         busySince = SystemClock.elapsedRealtime();
-        Logs.i(this, TAG, "Volume Down pressed");
+        Logs.i(this, TAG, started);
         if (Prefs.apiKey(this).isEmpty()) {
             fail("No Gemini API key saved. Open the app, paste the key and tap Test API key.", null);
             return;
@@ -192,7 +454,7 @@ public class SolverService extends AccessibilityService {
             boolean accepted = dispatchGesture(gesture, new AccessibilityService.GestureResultCallback() {
                 @Override
                 public void onCompleted(GestureDescription description) {
-                    busy.set(false);
+                    finish();
                     Logs.i(SolverService.this, TAG, "Tap completed");
                 }
 
@@ -210,8 +472,14 @@ public class SolverService extends AccessibilityService {
     }
 
     private void fail(String message, Throwable error) {
-        busy.set(false);
+        finish();
         Logs.e(this, TAG, message, error);
+    }
+
+    /** The run is over (answered, failed or cancelled): allow the next one, after a short quiet time for taps. */
+    private void finish() {
+        quietUntil = SystemClock.uptimeMillis() + QUIET_AFTER_RUN_MS;
+        busy.set(false);
     }
 
     private static Bitmap toSoftwareBitmap(AccessibilityService.ScreenshotResult result) {

@@ -19,6 +19,10 @@ final class Prefs {
     static final int DEFAULT_WAIT_SECONDS = 10;
     static final int MIN_WAIT_SECONDS = 3;
     static final int MAX_WAIT_SECONDS = 60;
+    /** Quick taps in a row that start the solver ("more than 3"), and the range the settings accept. */
+    static final int DEFAULT_TAPS = 4;
+    static final int MIN_TAPS = 3;
+    static final int MAX_TAPS = 10;
 
     private Prefs() {
     }
@@ -77,6 +81,28 @@ final class Prefs {
 
     static boolean active(Context c) {
         return sp(c).getBoolean("active", true);
+    }
+
+    /** Whether several quick taps on the screen start the solver, like Volume Down does. */
+    static boolean tapTrigger(Context c) {
+        return sp(c).getBoolean("tap_trigger", true);
+    }
+
+    /** How many quick taps in a row start the solver. */
+    static int tapCount(Context c) {
+        return Math.max(MIN_TAPS, Math.min(MAX_TAPS, sp(c).getInt("tap_count", DEFAULT_TAPS)));
+    }
+
+    /** Saves the tap trigger switch and the text of the taps field; anything that is not a number gives the default. */
+    static void setTap(Context c, boolean on, String countText) {
+        int taps = DEFAULT_TAPS;
+        try {
+            taps = Integer.parseInt(countText.trim());
+        } catch (NumberFormatException ignored) {
+            // keeps the default
+        }
+        taps = Math.max(MIN_TAPS, Math.min(MAX_TAPS, taps));
+        sp(c).edit().putBoolean("tap_trigger", on).putInt("tap_count", taps).apply();
     }
 
     /** The API route that last worked with the saved key and model ("" = not known yet). */
