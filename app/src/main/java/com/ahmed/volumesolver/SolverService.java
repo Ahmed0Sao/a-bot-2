@@ -34,7 +34,7 @@ public class SolverService extends AccessibilityService {
         super.onServiceConnected();
         Logs.i(this, TAG, "Service connected. model=" + Prefs.model(this)
                 + ", fallbacks=[" + Prefs.fallbacks(this) + "]"
-                + ", reference file=" + Reference.describe(this)
+                + ", reference files=" + Reference.describe(this)
                 + ", active=" + Prefs.active(this)
                 + ", API key " + (Prefs.apiKey(this).isEmpty() ? "NOT set" : "set"));
     }
@@ -68,7 +68,8 @@ public class SolverService extends AccessibilityService {
         return true;
     }
 
-    private static final long STUCK_AFTER_MS = 90000;
+    /** One key press can spend up to 140 s on models; after that the busy flag is assumed to be stuck. */
+    private static final long STUCK_AFTER_MS = 150000;
     private volatile long busySince;
 
     private void start() {
@@ -113,13 +114,17 @@ public class SolverService extends AccessibilityService {
             }
             final int w = shot.getWidth();
             final int h = shot.getHeight();
-            Logs.i(this, TAG, "Screenshot " + w + "x" + h + " captured in "
-                    + (SystemClock.elapsedRealtime() - startedAt) + " ms");
+            final long captured = SystemClock.elapsedRealtime();
+            Logs.i(this, TAG, "Screenshot " + w + "x" + h + " captured in " + (captured - startedAt) + " ms");
             final boolean blank = looksBlank(shot);
             final byte[] jpeg = toJpeg(shot);
             shot.recycle();
+            final long prepared = SystemClock.elapsedRealtime();
+            Logs.i(this, TAG, "Image prepared in " + (prepared - captured) + " ms (" + jpeg.length / 1024
+                    + " KB JPEG). Asking the model.");
 
             GeminiClient.Answer answer = GeminiClient.solve(this, Prefs.apiKey(this), Prefs.model(this), jpeg);
+            final long answered = SystemClock.elapsedRealtime();
             logEvidence(answer);
             if (!answer.found) {
                 fail(blank
@@ -143,31 +148,38 @@ public class SolverService extends AccessibilityService {
             final float y = clamp((float) ((yMin + yMax) / 2000.0 * h), 1f, h - 1f);
             Logs.i(this, TAG, "Answer \"" + answer.text + "\" from " + answer.model + " box_2d=[" + yMin + ", " + xMin + ", " + yMax + ", "
                     + xMax + "] -> tap at (" + Math.round(x) + ", " + Math.round(y) + ") on " + w + "x" + h);
+            Logs.i(this, TAG, "Timing: screenshot " + (captured - startedAt) + " ms + image " + (prepared - captured)
+                    + " ms + model " + (answered - prepared) + " ms = " + (answered - startedAt)
+                    + " ms from the key press to the tap");
             main.post(() -> tap(x, y));
         } catch (Throwable t) {
-            fail("Request failed", t);
+            fail("Request failed after " + (SystemClock.elapsedRealtime() - startedAt) + " ms", t);
         }
     }
 
-    /** With a reference file attached: what the model quoted from it, and whether the quote is really in the file. */
+    /**
+     * With reference files attached: what the model quoted from them, which file it came from, and whether the quote
+     * is really in the files.
+     */
     private void logEvidence(GeminiClient.Answer answer) {
         if (answer.reference.isEmpty()) {
             return;
         }
         if (answer.evidence.isEmpty()) {
-            Logs.i(this, TAG, "Reference file " + answer.reference + ": " + answer.model + " found no passage that "
-                    + "answers this question and used its own knowledge.");
+            Logs.i(this, TAG, "Reference files (" + answer.reference + "): " + answer.model + " found no passage "
+                    + "that answers this question and used its own knowledge.");
             return;
         }
+        String from = answer.evidenceSource.isEmpty() ? answer.reference : answer.evidenceSource;
         String check;
         if (answer.evidenceInReference == null) {
-            check = "not checked, the file is a PDF or image";
+            check = "not checked: the quote is empty, or the app cannot search PDFs and images";
         } else if (answer.evidenceInReference) {
             check = "this quote is in the file";
         } else {
-            check = "WARNING: this quote was NOT found in the file, the model may have made it up";
+            check = "WARNING: this quote was NOT found in any of the attached text files, the model may have made it up";
         }
-        Logs.i(this, TAG, "Evidence from " + answer.reference + ": \"" + answer.evidence + "\" (" + check + ")");
+        Logs.i(this, TAG, "Evidence from " + from + ": \"" + answer.evidence + "\" (" + check + ")");
     }
 
     private void tap(float x, float y) {

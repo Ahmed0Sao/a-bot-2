@@ -7,6 +7,10 @@ import org.xml.sax.Attributes;
 import org.xml.sax.InputSource;
 import org.xml.sax.helpers.DefaultHandler;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -19,6 +23,8 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.TreeMap;
 import java.util.zip.ZipEntry;
@@ -27,15 +33,16 @@ import java.util.zip.ZipInputStream;
 import javax.xml.parsers.SAXParserFactory;
 
 /**
- * The optional reference file ("Attach file" in the app). When one is attached, every question is sent together
- * with it and the model is told to answer from it. With no file attached nothing changes.
+ * The optional reference files ("Attach files" in the app). When some are attached, every question is sent together
+ * with them and the model is told to answer from them. With no file attached nothing changes.
  * <p>
- * The file is converted once, when it is attached, and the result is kept in the app's private storage:
+ * Each file is converted once, when it is attached, and the result is kept in the app's private storage:
  * <ul>
  * <li>PDF and images are stored as they are and sent to Gemini as they are.</li>
  * <li>Text files (any encoding), Word (.docx) and PowerPoint (.pptx) files are turned into plain text.</li>
  * </ul>
- * Nothing in here needs Android classes besides Context, so it can be tested on a plain JVM.
+ * Attaching a file with the name of one that is already attached replaces it (the newer version). Nothing in here
+ * needs Android classes besides Context, so it can be tested on a plain JVM.
  */
 final class Reference {
 
@@ -45,13 +52,21 @@ final class Reference {
 
     /** Bigger files are refused outright. */
     static final long MAX_FILE_BYTES = 40L * 1024 * 1024;
-    /** PDF and images are sent inline as base64, which makes them a third bigger. */
+    /** All PDFs and images together; they are sent inline as base64, which makes them a third bigger. */
     static final int MAX_INLINE_BYTES = 15 * 1024 * 1024;
-    /** About 200k tokens of English text. Longer text is cut and the log says so. */
+    /** About 200k tokens of English text in one file. Longer text is cut and the log says so. */
     static final int MAX_TEXT_CHARS = 800000;
+    /** All text files together (about 250k tokens of English text). */
+    static final int MAX_TOTAL_TEXT_CHARS = 1000000;
+    static final int MAX_FILES = 10;
     private static final int MAX_XML_BYTES = 60 * 1024 * 1024;
 
-    private static final String FILE_NAME = "reference.dat";
+    private static final Object LOCK = new Object();
+
+    private static final String K_LIST = "ref_files";
+    private static final String K_NEXT_ID = "ref_next_id";
+    // Used by the version that kept a single file. Read once, to carry that file over.
+    private static final String OLD_FILE_NAME = "reference.dat";
     private static final String K_NAME = "ref_name";
     private static final String K_KIND = "ref_kind";
     private static final String K_MIME = "ref_mime";
@@ -64,6 +79,7 @@ final class Reference {
 
     /** What is attached. */
     static final class Info {
+        final int id;
         final String name;
         final String kind;
         /** MIME type used when the file is sent (text is sent as text). */
@@ -75,7 +91,8 @@ final class Reference {
         /** How the file was read, e.g. "Word document" or "text, UTF-8, cut to the first 800,000 of 1,200,000 characters". */
         final String note;
 
-        Info(String name, String kind, String mime, int size, int chars, String note) {
+        Info(int id, String name, String kind, String mime, int size, int chars, String note) {
+            this.id = id;
             this.name = name;
             this.kind = kind;
             this.mime = mime;
@@ -90,9 +107,19 @@ final class Reference {
             }
             return name + " (" + note + ", " + readableSize(size) + ")";
         }
+
+        JSONObject toJson() throws JSONException {
+            return new JSONObject().put("id", id).put("name", name).put("kind", kind).put("mime", mime)
+                    .put("size", size).put("chars", chars).put("note", note);
+        }
+
+        static Info fromJson(JSONObject o) {
+            return new Info(o.optInt("id"), o.optString("name", "attachment"), o.optString("kind", KIND_TEXT),
+                    o.optString("mime", ""), o.optInt("size"), o.optInt("chars"), o.optString("note", ""));
+        }
     }
 
-    /** The attached file, loaded for a request. */
+    /** One attached file, loaded for a request. */
     static final class Payload {
         final Info info;
         /** The text, for the text kind. */
@@ -109,58 +136,165 @@ final class Reference {
 
     // ---------------------------------------------------------------- stored state
 
-    /** The attached file, or null if there is none. */
-    static Info info(Context c) {
-        SharedPreferences p = Prefs.store(c);
-        String kind = p.getString(K_KIND, "");
-        if (kind.isEmpty()) {
-            return null;
+    /** The attached files in the order they were attached; empty if there are none. */
+    static List<Info> list(Context c) {
+        synchronized (LOCK) {
+            return new ArrayList<>(read(c));
         }
-        return new Info(p.getString(K_NAME, "attachment"), kind, p.getString(K_MIME, ""),
-                p.getInt(K_SIZE, 0), p.getInt(K_CHARS, 0), p.getString(K_NOTE, ""));
     }
 
+    /** "none", the one file, or the names of several. */
     static String describe(Context c) {
-        Info i = info(c);
-        return i == null ? "none" : i.describe();
+        List<Info> files = list(c);
+        if (files.isEmpty()) {
+            return "none";
+        }
+        if (files.size() == 1) {
+            return files.get(0).describe();
+        }
+        StringBuilder sb = new StringBuilder(files.size() + " files: ");
+        for (int i = 0; i < files.size(); i++) {
+            sb.append(i > 0 ? ", " : "").append(files.get(i).name);
+        }
+        return sb.toString();
     }
 
-    /** Loads the attached file for a request. Returns null if nothing is attached. */
-    static Payload load(Context c) throws IOException {
-        Info info = info(c);
-        if (info == null) {
-            return null;
+    /** The names of the payloads, separated by commas. */
+    static String names(List<Payload> payloads) {
+        StringBuilder sb = new StringBuilder();
+        for (Payload p : payloads) {
+            sb.append(sb.length() > 0 ? ", " : "").append(p.info.name);
         }
-        File f = file(c);
-        if (!f.isFile()) {
-            throw new IOException("The reference file \"" + info.name + "\" is marked as attached but its stored copy "
-                    + "is missing. Remove it and attach it again.");
-        }
-        byte[] data;
-        try (InputStream in = new FileInputStream(f)) {
-            data = readLimited(in, MAX_FILE_BYTES);
-        }
-        if (info.kind.equals(KIND_TEXT)) {
-            return new Payload(info, new String(data, StandardCharsets.UTF_8), null);
-        }
-        return new Payload(info, null, data);
+        return sb.toString();
     }
 
-    static void remove(Context c) {
-        file(c).delete();
-        Prefs.store(c).edit().remove(K_NAME).remove(K_KIND).remove(K_MIME).remove(K_SIZE).remove(K_CHARS)
-                .remove(K_NOTE).apply();
-        Logs.i(c, "Reference", "Reference file removed; questions are answered from the model's own knowledge.");
+    /**
+     * Loads the attached files for a request. A file whose stored copy is missing or unreadable is left out and
+     * described in {@code problems}, so one broken file does not stop the others from being used.
+     */
+    static List<Payload> load(Context c, List<String> problems) {
+        List<Payload> out = new ArrayList<>();
+        for (Info info : list(c)) {
+            File f = file(c, info.id);
+            if (!f.isFile()) {
+                problems.add("The reference file \"" + info.name + "\" is marked as attached but its stored copy "
+                        + "is missing. Remove it and attach it again.");
+                continue;
+            }
+            try (InputStream in = new FileInputStream(f)) {
+                byte[] data = readLimited(in, MAX_FILE_BYTES);
+                if (info.kind.equals(KIND_TEXT)) {
+                    out.add(new Payload(info, new String(data, StandardCharsets.UTF_8), null));
+                } else {
+                    out.add(new Payload(info, null, data));
+                }
+            } catch (IOException e) {
+                problems.add("The reference file \"" + info.name + "\" could not be read: " + e.getMessage());
+            }
+        }
+        return out;
     }
 
-    private static File file(Context c) {
-        return new File(c.getApplicationContext().getFilesDir(), FILE_NAME);
+    static void remove(Context c, int id) {
+        synchronized (LOCK) {
+            List<Info> files = read(c);
+            Info gone = null;
+            for (Info f : files) {
+                if (f.id == id) {
+                    gone = f;
+                }
+            }
+            if (gone == null) {
+                return;
+            }
+            file(c, id).delete();
+            files.remove(gone);
+            write(c, files);
+            Logs.i(c, "Reference", "Reference file removed: " + gone.name + ". "
+                    + (files.isEmpty() ? "No file is attached; questions are answered from the model's own knowledge."
+                    : files.size() + (files.size() == 1 ? " file is" : " files are") + " still attached."));
+        }
+    }
+
+    static void removeAll(Context c) {
+        synchronized (LOCK) {
+            for (Info f : read(c)) {
+                file(c, f.id).delete();
+            }
+            write(c, new ArrayList<Info>());
+            Logs.i(c, "Reference", "All reference files removed; questions are answered from the model's own knowledge.");
+        }
+    }
+
+    private static File file(Context c, int id) {
+        return new File(c.getApplicationContext().getFilesDir(), "reference_" + id + ".dat");
+    }
+
+    private static List<Info> read(Context c) {
+        SharedPreferences p = Prefs.store(c);
+        if (!p.contains(K_LIST)) {
+            migrate(c);
+        }
+        List<Info> out = new ArrayList<>();
+        try {
+            JSONArray a = new JSONArray(p.getString(K_LIST, "[]"));
+            for (int i = 0; i < a.length(); i++) {
+                out.add(Info.fromJson(a.getJSONObject(i)));
+            }
+        } catch (JSONException damaged) {
+            Logs.e(c, "Reference", "The list of attached files is damaged, so no file is attached. Attach them again.",
+                    damaged);
+            out.clear();
+        }
+        return out;
+    }
+
+    private static void write(Context c, List<Info> files) {
+        JSONArray a = new JSONArray();
+        try {
+            for (Info f : files) {
+                a.put(f.toJson());
+            }
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+        Prefs.store(c).edit().putString(K_LIST, a.toString()).apply();
+    }
+
+    private static int nextId(Context c) {
+        SharedPreferences p = Prefs.store(c);
+        int id = Math.max(1, p.getInt(K_NEXT_ID, 1));
+        p.edit().putInt(K_NEXT_ID, id + 1).apply();
+        return id;
+    }
+
+    /** The previous version kept one file in reference.dat. It becomes the first file of the list. */
+    private static void migrate(Context c) {
+        SharedPreferences p = Prefs.store(c);
+        List<Info> files = new ArrayList<>();
+        String kind = p.getString(K_KIND, "");
+        if (!kind.isEmpty()) {
+            int id = nextId(c);
+            File old = new File(c.getApplicationContext().getFilesDir(), OLD_FILE_NAME);
+            if (old.isFile() && old.renameTo(file(c, id))) {
+                files.add(new Info(id, p.getString(K_NAME, "attachment"), kind, p.getString(K_MIME, ""),
+                        p.getInt(K_SIZE, 0), p.getInt(K_CHARS, 0), p.getString(K_NOTE, "")));
+                Logs.i(c, "Reference", "The reference file from the previous version was carried over: "
+                        + files.get(0).describe());
+            } else {
+                Logs.e(c, "Reference", "The reference file \"" + p.getString(K_NAME, "attachment")
+                        + "\" of the previous version could not be carried over. Attach it again.", null);
+            }
+        }
+        p.edit().remove(K_NAME).remove(K_KIND).remove(K_MIME).remove(K_SIZE).remove(K_CHARS).remove(K_NOTE).apply();
+        write(c, files);
     }
 
     // ---------------------------------------------------------------- attaching
 
     /**
-     * Converts and stores a file. Throws an IOException whose message says what is wrong with the file.
+     * Converts and stores a file next to the ones already attached (a file with the same name replaces the old copy).
+     * Throws an IOException whose message says what is wrong with the file or why it does not fit.
      *
      * @param name     file name as shown by the picker (may be null)
      * @param mimeHint MIME type reported by the picker (may be null; the content decides)
@@ -208,15 +342,57 @@ final class Reference {
             chars = text.length();
         }
 
-        try (FileOutputStream out = new FileOutputStream(file(c), false)) {
-            out.write(store);
+        synchronized (LOCK) {
+            List<Info> files = read(c);
+            Info replaced = null;
+            for (Info f : files) {
+                if (f.name.equalsIgnoreCase(shown)) {
+                    replaced = f;
+                }
+            }
+            if (replaced == null && files.size() >= MAX_FILES) {
+                throw new IOException("There are already " + MAX_FILES + " files attached, which is the most. "
+                        + "Remove one first.");
+            }
+            long binary = kind.equals(KIND_TEXT) ? 0 : store.length;
+            long textChars = chars;
+            for (Info f : files) {
+                if (f == replaced) {
+                    continue;
+                }
+                if (f.kind.equals(KIND_TEXT)) {
+                    textChars += f.chars;
+                } else {
+                    binary += f.size;
+                }
+            }
+            if (binary > MAX_INLINE_BYTES) {
+                throw new IOException("The PDFs and images together would be " + readableSize(binary) + ". They are "
+                        + "sent with every question, so the limit for all of them is " + readableSize(MAX_INLINE_BYTES)
+                        + ". Remove a file first or attach a smaller one.");
+            }
+            if (textChars > MAX_TOTAL_TEXT_CHARS) {
+                throw new IOException("The text files together would have " + String.format(Locale.US, "%,d", textChars)
+                        + " characters, and the limit for all of them is " + String.format(Locale.US, "%,d",
+                        MAX_TOTAL_TEXT_CHARS) + " (about 250 pages). Remove a file first or attach a shorter one.");
+            }
+
+            int id = nextId(c);
+            try (FileOutputStream out = new FileOutputStream(file(c, id), false)) {
+                out.write(store);
+            }
+            if (replaced != null) {
+                file(c, replaced.id).delete();
+                files.remove(replaced);
+            }
+            Info info = new Info(id, shown, kind, mime, store.length, chars, note);
+            files.add(info);
+            write(c, files);
+            Logs.i(c, "Reference", "Reference file " + (replaced != null ? "replaced" : "attached") + ": "
+                    + info.describe() + ". " + files.size() + (files.size() == 1 ? " file is" : " files are")
+                    + " now used to answer every question.");
+            return info;
         }
-        Prefs.store(c).edit().putString(K_NAME, shown).putString(K_KIND, kind).putString(K_MIME, mime)
-                .putInt(K_SIZE, store.length).putInt(K_CHARS, chars).putString(K_NOTE, note).apply();
-        Info info = new Info(shown, kind, mime, store.length, chars, note);
-        Logs.i(c, "Reference", "Reference file attached: " + info.describe() + ". Every question is now answered "
-                + "from it.");
-        return info;
     }
 
     private static void requireInline(int bytes, String what) throws IOException {
@@ -447,6 +623,62 @@ final class Reference {
             }
         }
         return checked ? Boolean.TRUE : null;
+    }
+
+    /** Result of {@link #checkQuote}. */
+    static final class QuoteCheck {
+        /** TRUE found, FALSE the model made it up, null cannot be checked. */
+        final Boolean found;
+        /** The text file the quote was found in ("" if not found or not checked). */
+        final String file;
+
+        QuoteCheck(Boolean found, String file) {
+            this.found = found;
+            this.file = file;
+        }
+    }
+
+    /**
+     * Checks the quote the model gave as evidence against the attached files. The file the model named as its
+     * source is tried first, then every other text file. Quotes from a PDF or an image cannot be checked here, so
+     * when such files are attached and the quote is in none of the text files, the answer is "cannot tell".
+     */
+    static QuoteCheck checkQuote(List<Payload> payloads, String quote, String source) {
+        if (quote == null || quote.trim().isEmpty()) {
+            return new QuoteCheck(null, "");
+        }
+        boolean hasText = false;
+        boolean hasBinary = false;
+        boolean unclear = false;
+        String wanted = source == null ? "" : source.trim();
+        if (!wanted.isEmpty()) {
+            for (Payload p : payloads) {
+                if (p.info.kind.equals(KIND_TEXT) && p.info.name.equalsIgnoreCase(wanted)) {
+                    Boolean r = quoteInText(p.text, quote);
+                    if (Boolean.TRUE.equals(r)) {
+                        return new QuoteCheck(Boolean.TRUE, p.info.name);
+                    }
+                }
+            }
+        }
+        for (Payload p : payloads) {
+            if (!p.info.kind.equals(KIND_TEXT)) {
+                hasBinary = true;
+                continue;
+            }
+            hasText = true;
+            Boolean r = quoteInText(p.text, quote);
+            if (Boolean.TRUE.equals(r)) {
+                return new QuoteCheck(Boolean.TRUE, p.info.name);
+            }
+            if (r == null) {
+                unclear = true;
+            }
+        }
+        if (!hasText || hasBinary || unclear) {
+            return new QuoteCheck(null, "");
+        }
+        return new QuoteCheck(Boolean.FALSE, "");
     }
 
     private static String normalize(String s) {

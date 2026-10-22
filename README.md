@@ -47,16 +47,35 @@ Free-tier limits are counted per model, so a model that has used up its daily re
 - If every model is used up the log lists them all with the reason, and the last HTTP response in full.
 - Quotas change over time. Check what each model currently allows at aistudio.google.com/rate-limit. Linking a billing account to the project (Tier 1) removes the free-tier daily caps.
 
-## Reference file (Attach file)
+## Speed
 
-Small models make mistakes when they answer from memory. Under "Reference file" in the app, tap Attach file and pick your study material. From then on every question is sent together with that file, and the model is told to answer from it, not from memory. With no file attached nothing changes: the model answers from its own knowledge.
+A key press normally needs a few seconds. The log shows where the time goes, line by line:
 
-- Supported: PDF (scanned PDFs work too), text files in any encoding (UTF-8, UTF-16, Arabic windows-1256), Word (.docx), PowerPoint (.pptx), and images (PNG, JPEG, WEBP). Word and PowerPoint files are turned into plain text once, when you attach them. Old .doc/.ppt, Excel and other formats are refused with a message: export them as PDF or text first.
-- One file at a time; attaching another replaces it. Remove file goes back to answering without a file.
-- Limits: PDF and images up to 15 MB (they are sent with every question), text is cut after 800,000 characters (the Reference line shows when that happened). A PDF page costs about 258 tokens, so very long PDFs use more of the per-minute token quota.
-- The file is stored only inside the app on the phone and is sent to Google's Gemini API with each question, like the screenshot.
-- Check the file with Gemini sends the file with one tiny question (uses 1 request) and shows what the model read from it, so a problem shows up before you need it.
-- The model must copy the passage it used into an "evidence" field. The log shows it: for text, Word and PowerPoint files the app also checks that the quote really occurs in the file and logs a WARNING when it does not (a sign the model made it up). For PDFs and images the quote cannot be checked on the phone. If the file does not cover a question, the model answers from its own knowledge and the log says so.
+- `HTTP 200 in 4210 ms (gemini-3.8-flash: connect 120 ms, send and wait for the model 4050 ms, download 8 ms, reply 1 KB)`: connect is the network, "send and wait" is mostly the model thinking, download is the reply coming back.
+- `Tokens used by gemini-3.8-flash: ...`: what the model used, including its thinking tokens (thoughtsTokenCount or total_thought_tokens). A model that thinks for thousands of tokens is slow whatever the network does.
+- `Timing: screenshot ... + image ... + model ... = ... ms from the key press to the tap`.
+
+What the app does about slow models:
+
+- The first model is asked at once. If it has not answered after "Ask the next model after" seconds (setting, default 10; a very large reference file gets one extra second per 100 KB above 600 KB), the next model of the list is asked as well. The first answer wins and the other request is cancelled. Giving up on the first model and starting over would throw away the work it has already done, so it keeps running while the second one is tried.
+- A model that lost the race because it was slower is skipped for 30 minutes, so the next key press goes straight to a model that is fast right now. The log says so ("gemini-3.8-flash had been waiting for 10.1 s and was cancelled, skipped for 30 min").
+- At most two requests run at once, and nothing new is started when less than 3 seconds are left. One key press never spends more than 75 seconds on models (a very large reference file gets more). Requests above about 4 MB (big PDFs or images) are not sent to two models at once.
+- The price is free requests: when the first model is slow, the second model's daily allowance is used too. A longer setting (for example 20 seconds) uses fewer; a shorter one (3 to 5 seconds) answers sooner when a model is slow. If the first model answers within the time, no second request is made.
+- A model that answers with a server error (overloaded) is skipped for 2 minutes and the next model is asked at once, instead of asking the same model again.
+- Thinking level defaults to low. gemini-3.8-flash has no "minimal" level, so the app sends "low" for it; a model that rejects "minimal" is retried with "low" and not with its slower default.
+- Test API key shows how long the reply took, and which models were cancelled or skipped and why.
+
+## Reference files (Attach files)
+
+Small models make mistakes when they answer from memory. Under "Reference files" in the app, tap Attach files and pick your study material (you can select several files at once, or attach more later). From then on every question is sent together with all the attached files, and the model is told to answer from them, not from memory. With no file attached nothing changes: the model answers from its own knowledge.
+
+- Supported: PDF (scanned PDFs work too), text files in any encoding (UTF-8, UTF-16, Arabic windows-1256), Word (.docx), PowerPoint (.pptx), and images (PNG, JPEG, WEBP). Word and PowerPoint files are turned into plain text once, when you attach them. Old .doc/.ppt, Excel and other formats are refused with a message: export them as PDF or text first. If several files are picked and one is refused, the others are still attached and the message says which one failed and why.
+- Up to 10 files. Every file has its own Remove button; Remove all clears the list. Attaching a file with the name of one that is already attached replaces it (handy for a newer version).
+- Limits: PDFs and images together up to 15 MB (they are sent with every question), text files together up to 1,000,000 characters (about 250 pages), and one text file is cut after 800,000 characters (the line for the file shows when that happened). A PDF page costs about 258 tokens, so many or long PDFs use more of the per-minute token quota. The more you attach, the slower and more expensive every question is; attach what the exam covers.
+- The files are stored only inside the app on the phone and are sent to Google's Gemini API with each question, like the screenshot.
+- A file attached with the previous version of the app (one file) is carried over automatically.
+- Check the files with Gemini sends all files with one tiny question (uses 1 request): the model quotes the first sentence of each, so a problem with a file shows up before you need it.
+- The model must copy the passage it used into an "evidence" field, and with several files also name the file it came from. The log shows both. For text, Word and PowerPoint files the app checks that the quote really occurs in the attached text files and logs a WARNING when it does not (a sign the model made it up); if the model named the wrong file but the quote exists in another one, the log reports the file the quote is really in. PDFs and images cannot be searched on the phone, so a quote that is in none of the text files is reported as "not checked" when a PDF or image is attached. If the files do not cover a question, the model answers from its own knowledge and the log says so.
 
 ## Log
 
@@ -68,4 +87,4 @@ Screenshots are sent to Google's Gemini API with your own key (on the Interactio
 
 The API key is saved only on the phone, inside the app. It is not part of this project.
 
-The model name is editable in the app (default gemini-3.8-flash; the fallback list is described above). Thinking level is optional: leave it empty for the model default, or try low (or minimal) for faster answers. If the API rejects the value, the app retries once without it and the log shows what Google said.
+The model name is editable in the app (default gemini-3.8-flash; the fallback list is described above). Thinking level defaults to low; minimal is faster still on the models that have it, medium and high are slower and more careful, and empty means the model's own default. If the API rejects the value, the app retries once without it and the log shows what Google said.

@@ -14,6 +14,12 @@ final class Prefs {
     static final String DEFAULT_FALLBACKS =
             "gemini-3.6-flash, gemini-3-flash-preview, gemini-3.5-flash-lite, gemini-3.1-flash-lite";
 
+    static final String DEFAULT_THINKING = "low";
+    /** Seconds a model gets to answer before the next model is asked as well (see {@link GeminiClient}). */
+    static final int DEFAULT_WAIT_SECONDS = 10;
+    static final int MIN_WAIT_SECONDS = 3;
+    static final int MAX_WAIT_SECONDS = 60;
+
     private Prefs() {
     }
 
@@ -41,8 +47,32 @@ final class Prefs {
         return p.contains("fallbacks") ? p.getString("fallbacks", "").trim() : DEFAULT_FALLBACKS;
     }
 
+    /**
+     * Thinking level sent to the model. "low" (the fastest level every current Flash model accepts) until the user
+     * saves their own value; an empty saved value means "the model's own default", which is slower.
+     */
     static String thinking(Context c) {
-        return sp(c).getString("thinking", "").trim().toLowerCase(java.util.Locale.ROOT);
+        SharedPreferences p = sp(c);
+        String level = p.contains("thinking") ? p.getString("thinking", "") : DEFAULT_THINKING;
+        return level.trim().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /** How long a model is given, in seconds, before the next model is asked as well. */
+    static int waitSeconds(Context c) {
+        int seconds = sp(c).getInt("wait_seconds", DEFAULT_WAIT_SECONDS);
+        return seconds < 1 ? DEFAULT_WAIT_SECONDS : Math.min(seconds, MAX_WAIT_SECONDS);
+    }
+
+    /** Saves the text of the settings field; anything that is not a number goes back to the default. */
+    static void setWait(Context c, String text) {
+        int seconds = DEFAULT_WAIT_SECONDS;
+        try {
+            seconds = Integer.parseInt(text.trim());
+        } catch (NumberFormatException ignored) {
+            // keeps the default
+        }
+        seconds = Math.max(MIN_WAIT_SECONDS, Math.min(MAX_WAIT_SECONDS, seconds));
+        sp(c).edit().putInt("wait_seconds", seconds).apply();
     }
 
     static boolean active(Context c) {
@@ -59,52 +89,73 @@ final class Prefs {
     }
 
     /**
-     * Models whose daily quota ran out are remembered until it resets, so the next key press goes straight to
-     * the next model. Stored as "model|untilMillis;model|untilMillis".
+     * Models that cannot answer right now (daily quota used up, too slow, overloaded ...) are remembered for a
+     * while, so the next key press goes straight to the next model. Stored as
+     * "model|untilMillis|reason;model|untilMillis|reason".
      */
     static long skipUntil(Context c, String model) {
-        for (String entry : sp(c).getString("skip", "").split(";")) {
-            int bar = entry.lastIndexOf('|');
-            if (bar > 0 && entry.substring(0, bar).equals(model)) {
-                try {
-                    return Long.parseLong(entry.substring(bar + 1));
-                } catch (NumberFormatException ignored) {
-                    return 0;
-                }
-            }
-        }
-        return 0;
+        String[] entry = findSkip(c, model);
+        return entry == null ? 0 : Long.parseLong(entry[1]);
+    }
+
+    /** Why the model is being skipped ("" if it is not or the reason is not known). */
+    static String skipReason(Context c, String model) {
+        String[] entry = findSkip(c, model);
+        return entry == null ? "" : entry[2];
     }
 
     static void setSkipUntil(Context c, String model, long untilMillis) {
-        writeSkips(c, model, untilMillis);
+        writeSkips(c, model, untilMillis, "");
+    }
+
+    static void setSkipUntil(Context c, String model, long untilMillis, String reason) {
+        writeSkips(c, model, untilMillis, reason);
     }
 
     static void clearSkip(Context c, String model) {
-        writeSkips(c, model, 0);
+        writeSkips(c, model, 0, "");
+    }
+
+    /** {model, untilMillis, reason} of one stored entry, or null if the text is not a valid entry. */
+    private static String[] parseSkip(String raw) {
+        String[] parts = raw.split("\\|", 3);
+        if (parts.length < 2 || parts[0].isEmpty()) {
+            return null;
+        }
+        try {
+            Long.parseLong(parts[1]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        return new String[]{parts[0], parts[1], parts.length > 2 ? parts[2] : ""};
+    }
+
+    private static String[] findSkip(Context c, String model) {
+        for (String raw : sp(c).getString("skip", "").split(";")) {
+            String[] entry = parseSkip(raw);
+            if (entry != null && entry[0].equals(model)) {
+                return entry;
+            }
+        }
+        return null;
     }
 
     /** Rewrites the skip list: drops expired entries, replaces the entry of {@code model} (0 = remove it). */
-    private static void writeSkips(Context c, String model, long untilMillis) {
+    private static void writeSkips(Context c, String model, long untilMillis, String reason) {
         long now = System.currentTimeMillis();
         StringBuilder sb = new StringBuilder();
-        for (String entry : sp(c).getString("skip", "").split(";")) {
-            int bar = entry.lastIndexOf('|');
-            if (bar <= 0) {
-                continue;
-            }
-            long until;
-            try {
-                until = Long.parseLong(entry.substring(bar + 1));
-            } catch (NumberFormatException e) {
-                continue;
-            }
-            if (!entry.substring(0, bar).equals(model) && until > now) {
-                sb.append(entry).append(';');
+        for (String raw : sp(c).getString("skip", "").split(";")) {
+            String[] entry = parseSkip(raw);
+            if (entry != null && !entry[0].equals(model) && Long.parseLong(entry[1]) > now) {
+                sb.append(entry[0]).append('|').append(entry[1]).append('|').append(entry[2]).append(';');
             }
         }
         if (untilMillis > now) {
-            sb.append(model).append('|').append(untilMillis);
+            String clean = reason.replace(';', ',').replace('|', '/').replace('\n', ' ').trim();
+            if (clean.length() > 120) {
+                clean = clean.substring(0, 120);
+            }
+            sb.append(model).append('|').append(untilMillis).append('|').append(clean);
         }
         sp(c).edit().putString("skip", sb.toString()).apply();
     }
