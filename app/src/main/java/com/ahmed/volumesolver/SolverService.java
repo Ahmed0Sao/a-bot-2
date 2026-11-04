@@ -424,9 +424,13 @@ public class SolverService extends AccessibilityService {
                     fail(answer.model + " found a question but gave no answer text. Raw reply: " + answer.raw, null);
                     return;
                 }
-                AnswerLocator.Result located = AnswerLocator.find(screenText(w, h), answer.text,
+                List<AnswerLocator.Item> onScreen = screenText(w, h);
+                AnswerLocator.Result located = AnswerLocator.find(onScreen, answer.text,
                         answer.hasBox ? tapX : Double.NaN, answer.hasBox ? tapY : Double.NaN);
                 Logs.i(this, TAG, "Tap position from the screen text: " + located.log);
+                if (located.item == null) {
+                    logScreenText(onScreen);
+                }
                 if (located.item != null) {
                     tapX = clamp(located.item.centerX(), 1f, w - 1f);
                     tapY = clamp(located.item.centerY(), 1f, h - 1f);
@@ -488,9 +492,17 @@ public class SolverService extends AccessibilityService {
                 }
             }
             int[] budget = {MAX_NODES};
+            StringBuilder packages = new StringBuilder();
             for (AccessibilityNodeInfo root : roots) {
+                CharSequence pkg = root.getPackageName();
+                if (pkg != null && packages.indexOf(pkg.toString()) < 0) {
+                    packages.append(packages.length() > 0 ? ", " : "").append(pkg);
+                }
                 collect(root, items, budget, 0, screenW, screenH);
             }
+            Logs.i(this, TAG, "Read " + roots.size() + (roots.size() == 1 ? " window" : " windows") + " ("
+                    + (packages.length() == 0 ? "no package name" : packages) + "): " + (MAX_NODES - budget[0])
+                    + " views, " + items.size() + " with text.");
             if (budget[0] <= 0) {
                 Logs.i(this, TAG, "The screen has more than " + MAX_NODES + " views; only the first ones were read.");
             }
@@ -498,6 +510,17 @@ public class SolverService extends AccessibilityService {
             Logs.e(this, TAG, "Could not read the text on the screen", t);
         }
         return items;
+    }
+
+    /** When the answer was not found: the text that was on the screen, so the log shows why. */
+    private void logScreenText(List<AnswerLocator.Item> items) {
+        int shown = Math.min(items.size(), 60);
+        StringBuilder sb = new StringBuilder("Text on the screen when nothing matched (" + items.size() + " pieces"
+                + (items.size() > shown ? ", first " + shown : "") + "; each with its position):");
+        for (int i = 0; i < shown; i++) {
+            sb.append("\n  - ").append(items.get(i).describe());
+        }
+        Logs.i(this, TAG, sb.toString());
     }
 
     private static final int MAX_NODES = 4000;

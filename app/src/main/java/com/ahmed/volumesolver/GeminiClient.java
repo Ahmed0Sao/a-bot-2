@@ -9,12 +9,16 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.ProtocolException;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -28,6 +32,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.net.ssl.SSLException;
 
 /**
  * Minimal Gemini REST client.
@@ -276,6 +282,8 @@ final class GeminiClient {
     /** No new model is started when less than this is left of the time for one key press. */
     private static final long MIN_ATTEMPT_MS = 3000;
     private static final long MIN_HTTP_MS = 1000;
+    /** A connection that broke sooner than this after the request started is tried again on a new connection. */
+    private static final long QUICK_RETRY_MS = 5000;
     /** Requests up to this size (a screenshot) wait the normal time; every 100 KB beyond adds one second. */
     private static final long BONUS_FREE_CHARS = 600000;
     private static final long MAX_BONUS_MS = 40000;
@@ -805,7 +813,21 @@ final class GeminiClient {
                             + "one key press.";
                     continue;
                 }
-                rethrow(error); // a network failure, an unreadable reply ...: ends the key press like before
+                if (error instanceof IOException && isNetworkFailure((IOException) error)) {
+                    // The connection to this model broke (reset, aborted, TLS, DNS ...). That says nothing about the
+                    // other models, so they are still tried; only when none is left does the key press fail.
+                    boolean others = !running.isEmpty() || next < order.size();
+                    if (!others) {
+                        throw (IOException) error;
+                    }
+                    String why = "network error " + error.getClass().getSimpleName() + ": " + error.getMessage();
+                    Logs.i(ctx, TAG, r.model + " cannot answer: " + why + (running.isEmpty()
+                            ? ". Trying the next model." : ". Waiting for the model that is still running."));
+                    notes.add(r.model + ": " + why);
+                    lastDetail = why;
+                    continue;
+                }
+                rethrow(error); // an unreadable reply, a bug ...: ends the key press like before
             }
         } finally {
             for (Racer waiting : running) {
@@ -1354,6 +1376,18 @@ final class GeminiClient {
                 if (attempt.cancelled && !(failure instanceof CancelledException)) {
                     throw new CancelledException(name); // cancel() closed the connection under the blocked call
                 }
+                // A connection that broke early is asked again once on a new connection: it usually works. One that
+                // broke after a long wait is not, when another model can take over instead.
+                long failedAfter = SystemClock.elapsedRealtime() - t0;
+                boolean worthRetry = failedAfter < QUICK_RETRY_MS || attempt.retryServerErrors;
+                if (tryNo == 1 && isNetworkFailure(failure) && worthRetry
+                        && attempt.deadline - SystemClock.elapsedRealtime() > MIN_HTTP_MS + 1500) {
+                    Logs.i(ctx, TAG, "Network error from " + name + " after " + failedAfter + " ms ("
+                            + failure.getClass().getSimpleName() + ": " + failure.getMessage()
+                            + "), trying once more on a new connection in 0.5 s");
+                    pause(attempt, name, 500);
+                    continue;
+                }
                 throw failure;
             } finally {
                 conn.disconnect();
@@ -1377,6 +1411,12 @@ final class GeminiClient {
             default:
                 return "";
         }
+    }
+
+    /** A broken connection: reset, aborted, closed early, TLS or DNS trouble. Not an answer of the server. */
+    private static boolean isNetworkFailure(IOException e) {
+        return e instanceof SocketException || e instanceof EOFException || e instanceof SSLException
+                || e instanceof UnknownHostException || e instanceof ProtocolException;
     }
 
     /** Sleeps, but ends early with a {@link CancelledException} when the request is cancelled. */
