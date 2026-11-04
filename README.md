@@ -35,7 +35,7 @@ How it works and what it cannot do:
 - Tap on an empty part of the screen (the question text, the background). The app under your finger receives the taps as well: tapping an answer option 4 times selects it 4 times.
 - While a run is going on and for 1.5 s after it, taps are ignored (the answer tap that the app makes itself is not counted). While this app's own screens are open the trigger is off; 4 quick taps there only write a "Tap trigger test" line to the log, which is an easy way to check that taps are seen.
 - The log shows: `Tap trigger on: ...` when the service starts, `Tap trigger: the invisible window received its first touch ...` at the first touch on another app, `Tap trigger: 4 quick taps in 0.84 s (pauses between them: ...)` when a series starts the solver, and `Tap trigger: A series of N taps was dropped because ...` when a series was thrown away. If the first-touch line never appears after you touched another app, the phone does not deliver touches to the invisible window and the tap trigger cannot work on it (Volume Down still does).
-- To tell a series of taps from normal use, the service now has two more permissions in its configuration: it listens for scroll, click, long-press and typing events, and it may list the open windows (to see whether the keyboard is open). Screen text is never read, logged or stored; clicks are compared only as a number made from the button's class and label.
+- To tell a series of taps from normal use, the service now has two more permissions in its configuration: it listens for scroll, click, long-press and typing events, and it may list the open windows (to see whether the keyboard is open). Screen text is not read for this; clicks are compared only as a number made from the button's class and label. (Screen text is read only when a DeepSeek model answers, see the DeepSeek section.)
 - Every start costs one request of your free quota, so a false start is not free. If you notice false starts, raise the number of taps or switch the setting off.
 
 ## API keys and routes
@@ -62,6 +62,17 @@ Free-tier limits are counted per model, so a model that has used up its daily re
 - The log says which model answered and why the others were skipped. Test API key shows the same.
 - If every model is used up the log lists them all with the reason, and the last HTTP response in full.
 - Quotas change over time. Check what each model currently allows at aistudio.google.com/rate-limit. Linking a billing account to the project (Tier 1) removes the free-tier daily caps.
+
+## DeepSeek (optional second provider)
+
+Version 1.4 can use DeepSeek instead of, or next to, Gemini. Paste a DeepSeek API key into the "DeepSeek API key" field and tap Test DeepSeek key. Every model whose name starts with `deepseek` is sent to DeepSeek with that key; every other name goes to Google with the Gemini key. Put `deepseek-flash` into the Model field to make it the main model, or into the fallback list to use it only when the models before it cannot answer. `deepseek-flash` is DeepSeek-V4.1-Flash-1017 and reads images (`deepseek-v4-pro` does not).
+
+- It is the same chat as with Gemini: the screenshot and the instructions go to `https://api.deepseek.com/chat/completions` (OpenAI format) with the key as a bearer token. The key is never written to the log.
+- Thinking: the Thinking level field is translated. minimal and low switch DeepSeek's thinking off (it is on by default and slow), medium and high switch it on, empty keeps DeepSeek's own default. If DeepSeek rejects the thinking switch or JSON mode (HTTP 400/422), the request is repeated once without them.
+- DeepSeek's API is paid (there is no documented free tier; a granted balance, if the account has one, is used first). HTTP 402 in the log means the account has no balance. A 401/402 or a rejected key on one provider does not stop the other provider's models: the next model is still tried.
+- Models without a key saved are not asked (the log says so), so one key is enough for a mixed list.
+- Reference files: text, Word and PowerPoint files and images are sent. DeepSeek cannot read PDFs, so a PDF is left out of the DeepSeek request and the log says so (Gemini still gets it).
+- Where to tap: DeepSeek's documentation does not promise bounding boxes, so for a DeepSeek answer the app first looks for the answer text on the screen through the accessibility service (the text of the open windows is read once, compared with the answer and discarded) and taps the button that contains it. The label before an option ("B.", "(c)") is ignored, so is case and punctuation. If the text is on the screen more than once, the clickable one is taken, then the one nearest to the box DeepSeek gave. If the text is not found (a game, an image-only screen) the box DeepSeek gave is used, and the log says that it was not checked. The log line `Tap position from the screen text:` shows what was found.
 
 ## Speed
 
@@ -99,8 +110,8 @@ Open log in the app shows every step: key press, screenshot size and timing, whi
 
 ## Notes
 
-Screenshots are sent to Google's Gemini API with your own key (on the Interactions route they are sent with store=false, so no interaction history is kept). Apps that block screenshots (FLAG_SECURE) come back black; the log says so.
+Screenshots are sent to Google's Gemini API (or, for the models whose name starts with deepseek, to DeepSeek's API) with your own key (on the Interactions route they are sent with store=false, so no interaction history is kept). Apps that block screenshots (FLAG_SECURE) come back black; the log says so.
 
-The API key is saved only on the phone, inside the app. It is not part of this project.
+The API keys are saved only on the phone, inside the app. They are not part of this project.
 
 The model name is editable in the app (default gemini-3.8-flash; the fallback list is described above). Thinking level defaults to low; minimal is faster still on the models that have it, medium and high are slower and more careful, and empty means the model's own default. If the API rejects the value, the app retries once without it and the log shows what Google said.

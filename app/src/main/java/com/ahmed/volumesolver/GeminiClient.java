@@ -81,6 +81,11 @@ final class GeminiClient {
         double xMin;
         double yMax;
         double xMax;
+        /**
+         * Whether the reply holds a usable box_2d. Always true for a Gemini answer (a Gemini reply without one is
+         * an error). A DeepSeek reply may come without one: its tap position is then found from the screen text.
+         */
+        boolean hasBox;
     }
 
     /** Text produced by one model. */
@@ -252,6 +257,12 @@ final class GeminiClient {
 
     private static final String TAG = "Gemini";
     private static final String API_ROOT = "https://generativelanguage.googleapis.com/v1beta/";
+    /** DeepSeek's OpenAI-compatible API. Used for every model whose name starts with "deepseek". */
+    private static final String DEEPSEEK_ROOT = "https://api.deepseek.com/";
+    /** The route name shown in the log for DeepSeek requests (the endpoint it is sent to). */
+    static final String ROUTE_DEEPSEEK = "chat/completions";
+    /** DeepSeek-V4.1-Flash-1017, the model the user asked for; it reads images, the Pro model does not. */
+    static final String DEEPSEEK_DEFAULT_MODEL = "deepseek-flash";
     private static final int MAX_LOGGED_BODY = 8000;
     private static final long MODEL_MISSING_SKIP_MS = 30 * 60 * 1000L;
     private static final long UNKNOWN_RATE_LIMIT_SKIP_MS = 60 * 1000L;
@@ -342,7 +353,8 @@ final class GeminiClient {
             a.yMax = box.optDouble(2, 0);
             a.xMax = box.optDouble(3, 0);
         }
-        if (a.found && !(a.xMax > a.xMin && a.yMax > a.yMin)) {
+        a.hasBox = a.xMax > a.xMin && a.yMax > a.yMin;
+        if (a.found && !a.hasBox && !isDeepSeek(r.model)) {
             throw new IOException("Reply from " + r.model + " has no usable box_2d: " + reply);
         }
         return a;
@@ -462,6 +474,76 @@ final class GeminiClient {
     }
 
     /**
+     * Tiny text-only request to exactly one model, with that model's own key and no fallbacks. Used by the
+     * "Test DeepSeek key" button, so that the test says something about DeepSeek and not about another model.
+     */
+    static Reply pingModel(Context ctx, String apiKey, String model) throws IOException, JSONException {
+        List<Piece> pieces = new ArrayList<>();
+        pieces.add(Piece.text("Reply with the single word OK."));
+        long limitMs = 40000;
+        Attempt attempt = new Attempt(SystemClock.elapsedRealtime() + limitMs, limitMs, true);
+        String text = generateWith(ctx, apiKey, model, pieces, false, attempt);
+        return new Reply(text.trim(), model, "");
+    }
+
+    // ---------------------------------------------------------------- providers
+
+    /** Models whose name starts with "deepseek" are sent to DeepSeek with the DeepSeek key; all others to Google. */
+    static boolean isDeepSeek(String model) {
+        return model.toLowerCase(Locale.ROOT).startsWith("deepseek");
+    }
+
+    private static String providerName(String model) {
+        return isDeepSeek(model) ? "DeepSeek" : "Gemini";
+    }
+
+    /** The API key that the model needs ("" if it has none saved). */
+    private static String keyFor(Context ctx, String geminiKey, String model) {
+        return isDeepSeek(model) ? Prefs.deepseekKey(ctx) : geminiKey;
+    }
+
+    /** The first DeepSeek model of the main model and the fallbacks, or the default DeepSeek model if there is none. */
+    static String deepseekModelToTest(Context ctx) {
+        for (String m : modelChain(Prefs.model(ctx), Prefs.fallbacks(ctx))) {
+            if (isDeepSeek(m)) {
+                return m;
+            }
+        }
+        return DEEPSEEK_DEFAULT_MODEL;
+    }
+
+    /**
+     * Null when at least one model of the list has its key saved, otherwise what to tell the user. Models without a
+     * key are left out of every request, so a list that mixes Gemini and DeepSeek models also works with one key.
+     */
+    static String missingKey(Context ctx) {
+        boolean gemini = false;
+        boolean deepseek = false;
+        for (String m : modelChain(Prefs.model(ctx), Prefs.fallbacks(ctx))) {
+            if (isDeepSeek(m)) {
+                deepseek = true;
+                if (!Prefs.deepseekKey(ctx).isEmpty()) {
+                    return null;
+                }
+            } else {
+                gemini = true;
+                if (!Prefs.apiKey(ctx).isEmpty()) {
+                    return null;
+                }
+            }
+        }
+        if (deepseek && !gemini) {
+            return "No DeepSeek API key saved. Open the app, paste the DeepSeek key and tap Test DeepSeek key.";
+        }
+        if (gemini && !deepseek) {
+            return "No Gemini API key saved. Open the app, paste the key and tap Test API key.";
+        }
+        return "No API key saved for the models in the list. Open the app and paste the Gemini key and/or the "
+                + "DeepSeek key (the models whose name starts with \"deepseek\" use the DeepSeek key, all others the "
+                + "Gemini key).";
+    }
+
+    /**
      * Used by the file check button when reference files are attached: sends all of them with a tiny question to
      * prove that Google accepts them and that the model can read each one.
      */
@@ -565,7 +647,7 @@ final class GeminiClient {
         if (useSkips) {
             boolean anyUsable = false;
             for (String m : chain) {
-                if (Prefs.skipUntil(ctx, m) <= now) {
+                if (Prefs.skipUntil(ctx, m) <= now && !keyFor(ctx, apiKey, m).isEmpty()) {
                     anyUsable = true;
                 }
             }
@@ -579,6 +661,11 @@ final class GeminiClient {
         List<Integer> order = new ArrayList<>(); // positions in the list of the models that are going to be asked
         for (int i = 0; i < chain.size(); i++) {
             String m = chain.get(i);
+            if (keyFor(ctx, apiKey, m).isEmpty()) {
+                Logs.i(ctx, TAG, "Not asking " + m + ": no " + providerName(m) + " API key is saved for it.");
+                notes.add(m + ": no " + providerName(m) + " API key saved");
+                continue;
+            }
             long until = Prefs.skipUntil(ctx, m);
             if (useSkips && until > now) {
                 String reason = Prefs.skipReason(ctx, m);
@@ -691,7 +778,14 @@ final class GeminiClient {
                     ApiException e = (ApiException) error;
                     String why = moveOnReason(ctx, r.model, e);
                     if (why == null) {
-                        throw e; // not about this model (bad key, bad request ...): the other models would say the same
+                        // Not about this model (bad key, bad request ...): the other models of the same provider
+                        // would say the same. A model of the other provider has its own key, so it is still tried.
+                        String other = otherProvider(chain, order, next, running, r.model);
+                        if (other == null) {
+                            throw e;
+                        }
+                        why = "HTTP " + e.code + " is about the " + providerName(r.model) + " key or request, not "
+                                + "about the model; the " + other + " models are still tried";
                     }
                     Logs.i(ctx, TAG, r.model + " cannot answer: " + why
                             + (running.isEmpty() && next < order.size() ? ". Trying the next model." : ".")
@@ -767,6 +861,24 @@ final class GeminiClient {
         return new Reply(won.text, won.model, join(notes));
     }
 
+    /** The name of the other provider if one of its models is still running or still to be asked, else null. */
+    private static String otherProvider(List<String> chain, List<Integer> order, int next, List<Racer> running,
+                                        String failed) {
+        boolean deepseek = isDeepSeek(failed);
+        for (Racer r : running) {
+            if (isDeepSeek(r.model) != deepseek) {
+                return providerName(r.model);
+            }
+        }
+        for (int i = next; i < order.size(); i++) {
+            String m = chain.get(order.get(i));
+            if (isDeepSeek(m) != deepseek) {
+                return providerName(m);
+            }
+        }
+        return null;
+    }
+
     private static void rethrow(Throwable t) throws IOException, JSONException {
         if (t instanceof IOException) {
             throw (IOException) t;
@@ -828,7 +940,7 @@ final class GeminiClient {
 
     private static boolean mentionsMissingModel(String lowerBody) {
         return lowerBody.contains("model") && (lowerBody.contains("not found") || lowerBody.contains("not supported")
-                || lowerBody.contains("does not exist") || lowerBody.contains("is not available"));
+                || lowerBody.contains("not exist") || lowerBody.contains("is not available"));
     }
 
     private static long retryDelayMs(String body) {
@@ -875,6 +987,10 @@ final class GeminiClient {
     /** Sends the pieces (reference file, screenshot, instructions) to one model and returns its text. */
     private static String generateWith(Context ctx, String apiKey, String name, List<Piece> pieces,
                                        boolean json, Attempt attempt) throws IOException, JSONException {
+        if (isDeepSeek(name)) {
+            // DeepSeek has one route and its own key; the key passed in is the Gemini key and is not used here.
+            return viaDeepSeek(ctx, Prefs.deepseekKey(ctx), name, pieces, json, Prefs.thinking(ctx), attempt);
+        }
         String thinking = thinkingFor(ctx, name, Prefs.thinking(ctx));
 
         String known = Prefs.route(ctx);
@@ -983,6 +1099,117 @@ final class GeminiClient {
         }
     }
 
+    // ---------------------------------------------------------------- DeepSeek
+
+    /**
+     * One request to a DeepSeek model: POST /chat/completions (OpenAI format) with the key as a bearer token. The
+     * screenshot goes in as an image_url part. The thinking level of the settings is translated: "minimal" and "low"
+     * switch DeepSeek's thinking off (it is on by default and makes the answer slow), "medium" and "high" switch it
+     * on, an empty value leaves DeepSeek's own default.
+     */
+    private static String viaDeepSeek(Context ctx, String key, String name, List<Piece> pieces, boolean json,
+                                      String level, Attempt attempt) throws IOException, JSONException {
+        int pdfs = 0;
+        for (Piece p : pieces) {
+            if (p.type.equals(Piece.DOCUMENT)) {
+                pdfs++;
+            }
+        }
+        if (pdfs > 0) {
+            Logs.i(ctx, TAG, "WARNING: " + name + " reads text and images only, not PDFs: " + pdfs
+                    + (pdfs == 1 ? " PDF is" : " PDFs are") + " left out of this request. Attach the study material "
+                    + "as text, Word or PowerPoint files (or export the PDF as images) if " + name + " should use it.");
+        }
+        String url = DEEPSEEK_ROOT + "chat/completions";
+        boolean options = true;
+        while (true) {
+            JSONObject body = deepseekBody(name, pieces, json, level, options);
+            try {
+                String response = post(ctx, url, ROUTE_DEEPSEEK, name, key, body, attempt);
+                return deepseekText(response);
+            } catch (ApiException e) {
+                // 400/422: this model does not take one of the optional settings (thinking switch, JSON mode).
+                // Asking again without them gives a slower or less tidy answer, but an answer.
+                boolean badOptions = (e.code == 400 || e.code == 422) && !mentionsMissingModel(e.body.toLowerCase(Locale.ROOT));
+                if (!(options && badOptions)) {
+                    throw e;
+                }
+                Logs.i(ctx, TAG, "HTTP " + e.code + " from " + name + ". Retrying once without the optional settings "
+                        + "(thinking switch, JSON mode).\n" + e.getMessage());
+                options = false;
+            }
+        }
+    }
+
+    private static JSONObject deepseekBody(String model, List<Piece> pieces, boolean json, String level,
+                                           boolean options) throws JSONException {
+        List<JSONObject> parts = new ArrayList<>();
+        for (Piece p : pieces) {
+            if (p.type.equals(Piece.TEXT)) {
+                parts.add(new JSONObject().put("type", "text").put("text", p.data));
+            } else if (p.type.equals(Piece.IMAGE)) {
+                JSONObject image = new JSONObject().put("url", "data:" + p.mime + ";base64," + p.data);
+                parts.add(new JSONObject().put("type", "image_url").put("image_url", image));
+            } else {
+                // A PDF cannot be sent. The line before it names it and says "It is the PDF that follows": change it
+                // so the model is not told to look at something that is not there.
+                int last = parts.size() - 1;
+                String title = last >= 0 ? parts.get(last).optString("text", "") : "";
+                int cut = title.indexOf(" (a trusted source");
+                if (title.startsWith("REFERENCE DOCUMENT") && cut > 0) {
+                    parts.set(last, new JSONObject().put("type", "text").put("text", title.substring(0, cut)
+                            + ": a PDF that you cannot read, so its content is NOT included. Do not guess what it says."));
+                } else {
+                    parts.add(new JSONObject().put("type", "text").put("text",
+                            "(A PDF reference document is not included: you cannot read PDFs.)"));
+                }
+            }
+        }
+        JSONArray content = new JSONArray();
+        for (JSONObject part : parts) {
+            content.put(part);
+        }
+        JSONObject message = new JSONObject().put("role", "user").put("content", content);
+        JSONObject body = new JSONObject()
+                .put("model", model)
+                .put("messages", new JSONArray().put(message))
+                .put("stream", false);
+        boolean thinkingOn = level.equals("medium") || level.equals("high");
+        body.put("max_tokens", thinkingOn ? 8192 : 2048);
+        if (options) {
+            if (json) {
+                body.put("response_format", new JSONObject().put("type", "json_object"));
+            }
+            if (level.equals("minimal") || level.equals("low")) {
+                body.put("thinking", new JSONObject().put("type", "disabled"));
+            } else if (thinkingOn) {
+                body.put("thinking", new JSONObject().put("type", "enabled"));
+                if (level.equals("high")) {
+                    body.put("reasoning_effort", "high");
+                }
+            }
+        }
+        return body;
+    }
+
+    /** chat/completions: choices[0].message.content (reasoning_content, if any, is the model's thinking: ignored). */
+    private static String deepseekText(String response) throws IOException, JSONException {
+        JSONObject root = new JSONObject(response.trim());
+        JSONArray choices = root.optJSONArray("choices");
+        if (choices == null || choices.length() == 0) {
+            throw new IOException("DeepSeek returned no choices\n" + cap(response));
+        }
+        JSONObject first = choices.getJSONObject(0);
+        JSONObject message = first.optJSONObject("message");
+        Object content = message == null ? null : message.opt("content");
+        String text = content instanceof String ? (String) content : "";
+        if (text.trim().isEmpty()) {
+            throw new IOException("DeepSeek returned an empty answer (finish_reason="
+                    + first.optString("finish_reason", "?") + ")\n" + cap(response));
+        }
+        return text;
+    }
+
     // ---------------------------------------------------------------- request bodies
 
     private static JSONObject generateBody(List<Piece> pieces, boolean json, String thinking, boolean options)
@@ -1059,7 +1286,11 @@ final class GeminiClient {
                 conn.setReadTimeout((int) remaining);
                 conn.setDoOutput(true);
                 conn.setRequestProperty("Content-Type", "application/json");
-                conn.setRequestProperty("x-goog-api-key", apiKey);
+                if (route.equals(ROUTE_DEEPSEEK)) {
+                    conn.setRequestProperty("Authorization", "Bearer " + apiKey);
+                } else {
+                    conn.setRequestProperty("x-goog-api-key", apiKey);
+                }
                 conn.connect(); // TCP + TLS; a failure here is a network problem, not a slow model
                 long connected = SystemClock.elapsedRealtime();
                 if (attempt.cancelled) {
@@ -1104,9 +1335,11 @@ final class GeminiClient {
                     return responseBody;
                 }
                 String reason = conn.getResponseMessage();
-                lastError = new ApiException(code, "Gemini returned HTTP " + code
+                boolean deepseek = route.equals(ROUTE_DEEPSEEK);
+                lastError = new ApiException(code, (deepseek ? "DeepSeek" : "Gemini") + " returned HTTP " + code
                         + (reason == null || reason.isEmpty() ? "" : " " + reason)
-                        + " (" + route + " route)\n" + cap(responseBody), responseBody);
+                        + (deepseek ? " (" + route + ")" : " (" + route + " route)") + "\n"
+                        + (deepseek ? deepseekHint(code) : "") + cap(responseBody), responseBody);
                 // A used-up quota will not be back in 1.5 s: the next model is the better answer to that. The same
                 // goes for an overloaded model while another model is still waiting to be asked.
                 boolean quota = code == 429 && responseBody.toLowerCase(Locale.ROOT).contains("quota");
@@ -1127,6 +1360,23 @@ final class GeminiClient {
             }
         }
         throw lastError != null ? lastError : new IOException("Request failed");
+    }
+
+    /** What the DeepSeek status codes mean for the user (from DeepSeek's error-code list). */
+    private static String deepseekHint(int code) {
+        switch (code) {
+            case 401:
+                return "DeepSeek did not accept the API key. Check the DeepSeek key in the app.\n";
+            case 402:
+                return "The DeepSeek account has no balance. The DeepSeek API is paid: top up at platform.deepseek.com, "
+                        + "then try again.\n";
+            case 429:
+                return "DeepSeek says too many requests were sent; try again in a moment.\n";
+            case 503:
+                return "DeepSeek is overloaded right now.\n";
+            default:
+                return "";
+        }
     }
 
     /** Sleeps, but ends early with a {@link CancelledException} when the request is cancelled. */
@@ -1151,7 +1401,8 @@ final class GeminiClient {
     }
 
     private static final String[] USAGE_FIELDS = {"promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount",
-            "totalTokenCount", "total_input_tokens", "total_output_tokens", "total_thought_tokens", "total_tokens"};
+            "totalTokenCount", "total_input_tokens", "total_output_tokens", "total_thought_tokens", "total_tokens",
+            "prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens"};
 
     /** What the model used for this answer. Thinking tokens are what makes a model slow. */
     private static void logUsage(Context ctx, String model, String response) {

@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
+import android.graphics.Rect;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.hardware.HardwareBuffer;
@@ -17,9 +18,11 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -27,7 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Listens for Volume Down (and, when switched on, several quick taps on the screen), screenshots the display, asks
- * Gemini for the correct answer and taps it. Nothing is ever shown on screen: all progress and errors go to
+ * Gemini (or DeepSeek) for the correct answer and taps it. Nothing is ever shown on screen: all progress and errors go to
  * {@link Logs}.
  */
 public class SolverService extends AccessibilityService {
@@ -57,7 +60,8 @@ public class SolverService extends AccessibilityService {
                 + ", reference files=" + Reference.describe(this)
                 + ", active=" + Prefs.active(this)
                 + ", tap trigger=" + (Prefs.tapTrigger(this) ? Prefs.tapCount(this) + " quick taps" : "off")
-                + ", API key " + (Prefs.apiKey(this).isEmpty() ? "NOT set" : "set"));
+                + ", Gemini API key " + (Prefs.apiKey(this).isEmpty() ? "NOT set" : "set")
+                + ", DeepSeek API key " + (Prefs.deepseekKey(this).isEmpty() ? "NOT set" : "set"));
         try {
             taps = new TapDetector(SAME_SPOT_DP * getResources().getDisplayMetrics().density, Prefs.tapCount(this));
             // The preference store keeps only a weak reference to the listener, so it is kept in a field.
@@ -345,8 +349,9 @@ public class SolverService extends AccessibilityService {
         }
         busySince = SystemClock.elapsedRealtime();
         Logs.i(this, TAG, started);
-        if (Prefs.apiKey(this).isEmpty()) {
-            fail("No Gemini API key saved. Open the app, paste the key and tap Test API key.", null);
+        String missing = GeminiClient.missingKey(this);
+        if (missing != null) {
+            fail(missing, null);
             return;
         }
         final long startedAt = SystemClock.elapsedRealtime();
@@ -391,7 +396,7 @@ public class SolverService extends AccessibilityService {
             if (!answer.found) {
                 fail(blank
                         ? "The screenshot is completely black: this app probably blocks screen capture (FLAG_SECURE)."
-                        : "Gemini did not find a question with selectable answers. Raw reply: " + answer.raw, null);
+                        : answer.model + " did not find a question with selectable answers. Raw reply: " + answer.raw, null);
                 return;
             }
 
@@ -406,16 +411,137 @@ public class SolverService extends AccessibilityService {
                 yMax *= 1000;
                 xMax *= 1000;
             }
-            final float x = clamp((float) ((xMin + xMax) / 2000.0 * w), 1f, w - 1f);
-            final float y = clamp((float) ((yMin + yMax) / 2000.0 * h), 1f, h - 1f);
-            Logs.i(this, TAG, "Answer \"" + answer.text + "\" from " + answer.model + " box_2d=[" + yMin + ", " + xMin + ", " + yMax + ", "
-                    + xMax + "] -> tap at (" + Math.round(x) + ", " + Math.round(y) + ") on " + w + "x" + h);
+            float tapX = Float.NaN;
+            float tapY = Float.NaN;
+            if (answer.hasBox) {
+                tapX = clamp((float) ((xMin + xMax) / 2000.0 * w), 1f, w - 1f);
+                tapY = clamp((float) ((yMin + yMax) / 2000.0 * h), 1f, h - 1f);
+            }
+            if (GeminiClient.isDeepSeek(answer.model)) {
+                // DeepSeek does not promise bounding boxes, so the answer text is looked up on the screen first. The
+                // box it gave (if any) is only used to choose between equal matches, or when the text is not found.
+                if (answer.text.trim().isEmpty()) {
+                    fail(answer.model + " found a question but gave no answer text. Raw reply: " + answer.raw, null);
+                    return;
+                }
+                AnswerLocator.Result located = AnswerLocator.find(screenText(w, h), answer.text,
+                        answer.hasBox ? tapX : Double.NaN, answer.hasBox ? tapY : Double.NaN);
+                Logs.i(this, TAG, "Tap position from the screen text: " + located.log);
+                if (located.item != null) {
+                    tapX = clamp(located.item.centerX(), 1f, w - 1f);
+                    tapY = clamp(located.item.centerY(), 1f, h - 1f);
+                    Logs.i(this, TAG, "Answer \"" + answer.text + "\" from " + answer.model + " -> tap at ("
+                            + Math.round(tapX) + ", " + Math.round(tapY) + ") on " + w + "x" + h
+                            + " (position of the text on the screen)");
+                } else if (answer.hasBox) {
+                    Logs.i(this, TAG, "Answer \"" + answer.text + "\" from " + answer.model + " box_2d=[" + yMin + ", "
+                            + xMin + ", " + yMax + ", " + xMax + "] -> tap at (" + Math.round(tapX) + ", "
+                            + Math.round(tapY) + ") on " + w + "x" + h + ". WARNING: the text was not found on the "
+                            + "screen, so this is the box " + answer.model + " gave, which is not checked.");
+                } else {
+                    fail(answer.model + " answered \"" + answer.text + "\" but the app cannot tell where to tap: "
+                            + "the text was not found on the screen and " + answer.model + " gave no box. "
+                            + "Raw reply: " + answer.raw, null);
+                    return;
+                }
+            } else {
+                Logs.i(this, TAG, "Answer \"" + answer.text + "\" from " + answer.model + " box_2d=[" + yMin + ", " + xMin
+                        + ", " + yMax + ", " + xMax + "] -> tap at (" + Math.round(tapX) + ", " + Math.round(tapY)
+                        + ") on " + w + "x" + h);
+            }
+            final float x = tapX;
+            final float y = tapY;
             Logs.i(this, TAG, "Timing: screenshot " + (captured - startedAt) + " ms + image " + (prepared - captured)
                     + " ms + model " + (answered - prepared) + " ms = " + (answered - startedAt)
                     + " ms from the key press to the tap");
             main.post(() -> tap(x, y));
         } catch (Throwable t) {
             fail("Request failed after " + (SystemClock.elapsedRealtime() - startedAt) + " ms", t);
+        }
+    }
+
+    /**
+     * The text that is on the screen now, with the area to tap for each piece, read from the accessibility tree (all
+     * windows except the keyboard). The text is only compared with the model's answer, never stored or logged apart
+     * from the matching pieces.
+     */
+    private List<AnswerLocator.Item> screenText(int screenW, int screenH) {
+        List<AnswerLocator.Item> items = new ArrayList<>();
+        try {
+            List<AccessibilityNodeInfo> roots = new ArrayList<>();
+            List<AccessibilityWindowInfo> windows = getWindows();
+            if (windows != null) {
+                for (AccessibilityWindowInfo window : windows) {
+                    if (window.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                        continue;
+                    }
+                    AccessibilityNodeInfo root = window.getRoot();
+                    if (root != null) {
+                        roots.add(root);
+                    }
+                }
+            }
+            if (roots.isEmpty()) {
+                AccessibilityNodeInfo root = getRootInActiveWindow();
+                if (root != null) {
+                    roots.add(root);
+                }
+            }
+            int[] budget = {MAX_NODES};
+            for (AccessibilityNodeInfo root : roots) {
+                collect(root, items, budget, 0, screenW, screenH);
+            }
+            if (budget[0] <= 0) {
+                Logs.i(this, TAG, "The screen has more than " + MAX_NODES + " views; only the first ones were read.");
+            }
+        } catch (Throwable t) {
+            Logs.e(this, TAG, "Could not read the text on the screen", t);
+        }
+        return items;
+    }
+
+    private static final int MAX_NODES = 4000;
+    private static final int MAX_DEPTH = 60;
+
+    private void collect(AccessibilityNodeInfo node, List<AnswerLocator.Item> items, int[] budget, int depth,
+                         int screenW, int screenH) {
+        if (node == null || budget[0] <= 0 || depth > MAX_DEPTH) {
+            return;
+        }
+        budget[0]--;
+        CharSequence text = node.getText();
+        if (text == null || text.length() == 0) {
+            text = node.getContentDescription();
+        }
+        if (text != null && text.length() > 0 && node.isVisibleToUser()) {
+            Rect own = new Rect();
+            node.getBoundsInScreen(own);
+            if (own.width() > 0 && own.height() > 0) {
+                Rect tap = own;
+                boolean clickable = node.isClickable();
+                if (!clickable) {
+                    // The option is usually a button that contains the text: tap the button, not just its label.
+                    AccessibilityNodeInfo parent = node.getParent();
+                    for (int up = 0; up < 6 && parent != null; up++) {
+                        if (parent.isClickable()) {
+                            Rect r = new Rect();
+                            parent.getBoundsInScreen(r);
+                            boolean whole = (long) r.width() * r.height() > 0.7 * screenW * screenH;
+                            if (!whole && r.width() > 0 && r.height() > 0) {
+                                tap = r;
+                                clickable = true;
+                            }
+                            break;
+                        }
+                        parent = parent.getParent();
+                    }
+                }
+                items.add(new AnswerLocator.Item(text.toString(), tap.left, tap.top, tap.right, tap.bottom, clickable));
+            }
+        }
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            collect(node.getChild(i), items, budget, depth + 1, screenW, screenH);
         }
     }
 

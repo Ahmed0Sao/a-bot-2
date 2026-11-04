@@ -40,6 +40,35 @@ final class Prefs {
         return sp(c).getString("api_key", "").trim();
     }
 
+    /** The DeepSeek API key ("" = none). Used for every model whose name starts with "deepseek". */
+    static String deepseekKey(Context c) {
+        return sp(c).getString("deepseek_key", "").trim();
+    }
+
+    static void setDeepseekKey(Context c, String key) {
+        SharedPreferences p = sp(c);
+        String clean = key.trim();
+        boolean changed = !clean.equals(p.getString("deepseek_key", ""));
+        SharedPreferences.Editor e = p.edit().putString("deepseek_key", clean);
+        if (changed) {
+            // another key may belong to another account: forget "too slow" or "overloaded" marks of its models
+            e.putString("skip", dropSkips(p.getString("skip", ""), "deepseek"));
+        }
+        e.apply();
+    }
+
+    /** The skip list without the entries whose model name starts with {@code prefix}. */
+    private static String dropSkips(String list, String prefix) {
+        StringBuilder sb = new StringBuilder();
+        for (String raw : list.split(";")) {
+            String[] entry = parseSkip(raw);
+            if (entry != null && !entry[0].toLowerCase(java.util.Locale.ROOT).startsWith(prefix)) {
+                sb.append(raw).append(';');
+            }
+        }
+        return sb.toString();
+    }
+
     static String model(Context c) {
         String m = sp(c).getString("model", DEFAULT_MODEL).trim();
         return m.isEmpty() ? DEFAULT_MODEL : m;

@@ -34,9 +34,11 @@ public class MainActivity extends Activity {
 
     private TextView status;
     private TextView testOutput;
+    private TextView deepseekOutput;
     private TextView referenceStatus;
     private LinearLayout fileList;
     private EditText keyField;
+    private EditText deepseekField;
     private EditText modelField;
     private EditText fallbackField;
     private EditText thinkingField;
@@ -61,8 +63,8 @@ public class MainActivity extends Activity {
 
         TextView intro = new TextView(this);
         intro.setText("Press Volume Down, or tap the screen several times quickly, on a screen with a "
-                + "multiple-choice question. The app screenshots it, asks Gemini for the correct option and taps "
-                + "it. Nothing is shown on screen when you do; all progress and every error go to the log "
+                + "multiple-choice question. The app screenshots it, asks Gemini (or DeepSeek) for the correct "
+                + "option and taps it. Nothing is shown on screen when you do; all progress and every error go to the log "
                 + "(button at the bottom).");
         add(col, intro, 8);
 
@@ -86,7 +88,22 @@ public class MainActivity extends Activity {
         keyField.setText(Prefs.apiKey(this));
         add(col, keyField, 0);
 
-        add(col, label("Model"), 12);
+        add(col, label("DeepSeek API key (optional). Used by every model whose name starts with \"deepseek\", for "
+                + "example deepseek-flash (DeepSeek-V4.1-Flash-1017, reads images). Put such a name in the Model "
+                + "field below to use it as the main model, or in the fallback list. DeepSeek's API is paid: the "
+                + "account needs a balance."), 20);
+        deepseekField = new EditText(this);
+        deepseekField.setSingleLine(true);
+        deepseekField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        deepseekField.setText(Prefs.deepseekKey(this));
+        add(col, deepseekField, 0);
+        add(col, button("Test DeepSeek key", v -> runDeepseekTest()), 4);
+        deepseekOutput = new TextView(this);
+        deepseekOutput.setTextIsSelectable(true);
+        add(col, deepseekOutput, 4);
+
+        add(col, label("Model (a name starting with \"deepseek\" uses the DeepSeek key, any other name the Gemini "
+                + "key)"), 12);
         modelField = new EditText(this);
         modelField.setSingleLine(true);
         modelField.setText(Prefs.model(this));
@@ -133,7 +150,7 @@ public class MainActivity extends Activity {
         fileList = new LinearLayout(this);
         fileList.setOrientation(LinearLayout.VERTICAL);
         add(col, fileList, 4);
-        add(col, button("Check the files with Gemini (uses 1 request)", v -> checkFiles()), 4);
+        add(col, button("Check the files with the model (uses 1 request)", v -> checkFiles()), 4);
         referenceStatus = new TextView(this);
         referenceStatus.setTextIsSelectable(true);
         add(col, referenceStatus, 4);
@@ -208,6 +225,7 @@ public class MainActivity extends Activity {
                 fallbackField.getText().toString(),
                 thinkingField.getText().toString(),
                 activeSwitch.isChecked());
+        Prefs.setDeepseekKey(this, deepseekField.getText().toString());
         Prefs.setWait(this, waitField.getText().toString());
         Prefs.setTap(this, tapSwitch.isChecked(), tapField.getText().toString());
     }
@@ -217,8 +235,9 @@ public class MainActivity extends Activity {
         final Context ctx = getApplicationContext();
         final String key = Prefs.apiKey(ctx);
         final String model = Prefs.model(ctx);
-        if (key.isEmpty()) {
-            testOutput.setText("Paste your API key first.");
+        String missing = GeminiClient.missingKey(ctx);
+        if (missing != null) {
+            testOutput.setText(missing);
             return;
         }
         testOutput.setText("Testing...");
@@ -241,6 +260,34 @@ public class MainActivity extends Activity {
             }
             final String text = out;
             runOnUiThread(() -> testOutput.setText(text));
+        }).start();
+    }
+
+    /** Sends one tiny request to the first DeepSeek model in the list (or deepseek-flash), with the DeepSeek key only. */
+    private void runDeepseekTest() {
+        save();
+        final Context ctx = getApplicationContext();
+        final String key = Prefs.deepseekKey(ctx);
+        final String model = GeminiClient.deepseekModelToTest(ctx);
+        if (key.isEmpty()) {
+            deepseekOutput.setText("Paste your DeepSeek API key first.");
+            return;
+        }
+        deepseekOutput.setText("Testing " + model + "...");
+        new Thread(() -> {
+            String out;
+            try {
+                long started = SystemClock.elapsedRealtime();
+                GeminiClient.Reply r = GeminiClient.pingModel(ctx, key, model);
+                long took = SystemClock.elapsedRealtime() - started;
+                out = "OK. " + r.model + " replied: " + r.text + " in " + took + " ms";
+                Logs.i(ctx, "Test", "DeepSeek key test OK. " + out);
+            } catch (Throwable t) {
+                Logs.e(ctx, "Test", "DeepSeek key test failed for model " + model, t);
+                out = "Failed (full details in the log): " + shorten(t);
+            }
+            final String text = out;
+            runOnUiThread(() -> deepseekOutput.setText(text));
         }).start();
     }
 
@@ -291,11 +338,12 @@ public class MainActivity extends Activity {
             showReference("Attach a file first.");
             return;
         }
-        if (key.isEmpty()) {
-            showReference("Paste your API key first.");
+        String missing = GeminiClient.missingKey(ctx);
+        if (missing != null) {
+            showReference(missing);
             return;
         }
-        showReference("Checking with Gemini...");
+        showReference("Checking with the model...");
         new Thread(() -> {
             final String result = checkAttachedFiles(ctx, key, model, attached);
             runOnUiThread(() -> {
