@@ -465,18 +465,20 @@ public class SolverService extends AccessibilityService {
     }
 
     /**
-     * The text that is on the screen now, with the area to tap for each piece, read from the accessibility tree (all
-     * windows except the keyboard). The text is only compared with the model's answer, never stored or logged apart
-     * from the matching pieces.
+     * The text that is on the screen now, with its position, read from the accessibility tree of the app windows (not
+     * the status bar, notifications or keyboard). It is compared with the model's answer. The pieces that match are
+     * written to the log, and when nothing matches the whole list is (see {@link #logScreenText}).
      */
     private List<AnswerLocator.Item> screenText(int screenW, int screenH) {
         List<AnswerLocator.Item> items = new ArrayList<>();
         try {
             List<AccessibilityNodeInfo> roots = new ArrayList<>();
+            int skipped = 0;
             List<AccessibilityWindowInfo> windows = getWindows();
             if (windows != null) {
                 for (AccessibilityWindowInfo window : windows) {
-                    if (window.getType() == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                    if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) {
+                        skipped++; // the keyboard, the status bar and notifications, overlays: never an answer option
                         continue;
                     }
                     AccessibilityNodeInfo root = window.getRoot();
@@ -500,9 +502,10 @@ public class SolverService extends AccessibilityService {
                 }
                 collect(root, items, budget, 0, screenW, screenH);
             }
-            Logs.i(this, TAG, "Read " + roots.size() + (roots.size() == 1 ? " window" : " windows") + " ("
+            Logs.i(this, TAG, "Read " + roots.size() + (roots.size() == 1 ? " app window" : " app windows") + " ("
                     + (packages.length() == 0 ? "no package name" : packages) + "): " + (MAX_NODES - budget[0])
-                    + " views, " + items.size() + " with text.");
+                    + " views, " + items.size() + " with text" + (skipped > 0 ? "; " + skipped + " system windows "
+                    + "(status bar, keyboard ...) were not read." : "."));
             if (budget[0] <= 0) {
                 Logs.i(this, TAG, "The screen has more than " + MAX_NODES + " views; only the first ones were read.");
             }
@@ -512,7 +515,10 @@ public class SolverService extends AccessibilityService {
         return items;
     }
 
-    /** When the answer was not found: the text that was on the screen, so the log shows why. */
+    /**
+     * When the answer was not found: the text that was on the screen, written to this app's log on the phone so the
+     * log shows why. Clear in the log screen deletes it.
+     */
     private void logScreenText(List<AnswerLocator.Item> items) {
         int shown = Math.min(items.size(), 60);
         StringBuilder sb = new StringBuilder("Text on the screen when nothing matched (" + items.size() + " pieces"
@@ -540,26 +546,23 @@ public class SolverService extends AccessibilityService {
             Rect own = new Rect();
             node.getBoundsInScreen(own);
             if (own.width() > 0 && own.height() > 0) {
-                Rect tap = own;
+                // The tap goes to the centre of the text itself: a touch there reaches the button around it. Whether
+                // there is such a button only helps to tell an option from the question when the text is there twice.
                 boolean clickable = node.isClickable();
                 if (!clickable) {
-                    // The option is usually a button that contains the text: tap the button, not just its label.
                     AccessibilityNodeInfo parent = node.getParent();
                     for (int up = 0; up < 6 && parent != null; up++) {
                         if (parent.isClickable()) {
                             Rect r = new Rect();
                             parent.getBoundsInScreen(r);
-                            boolean whole = (long) r.width() * r.height() > 0.7 * screenW * screenH;
-                            if (!whole && r.width() > 0 && r.height() > 0) {
-                                tap = r;
-                                clickable = true;
-                            }
+                            // a clickable view that fills most of the screen says nothing about this text
+                            clickable = (long) r.width() * r.height() <= 0.7 * screenW * screenH;
                             break;
                         }
                         parent = parent.getParent();
                     }
                 }
-                items.add(new AnswerLocator.Item(text.toString(), tap.left, tap.top, tap.right, tap.bottom, clickable));
+                items.add(new AnswerLocator.Item(text.toString(), own.left, own.top, own.right, own.bottom, clickable));
             }
         }
         int count = node.getChildCount();

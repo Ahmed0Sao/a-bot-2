@@ -16,12 +16,15 @@ final class AnswerLocator {
     /** One piece of text on the screen. */
     static final class Item {
         final String text;
-        /** The area to tap: the button the text belongs to when there is one, else the bounds of the text itself. */
+        /**
+         * Where the text is. The tap goes to its centre: a touch on a label reaches the button it belongs to, and the
+         * centre of the label is never on another option (the centre of a box around several options can be).
+         */
         final int left;
         final int top;
         final int right;
         final int bottom;
-        /** True when {@link #left}.. is a clickable view (the text, or a view around it, accepts clicks). */
+        /** True when the text, or a view around it that is not most of the screen, accepts clicks. */
         final boolean clickable;
 
         Item(String text, int left, int top, int right, int bottom, boolean clickable) {
@@ -41,8 +44,13 @@ final class AnswerLocator {
             return (top + bottom) / 2f;
         }
 
-        boolean sameArea(Item o) {
-            return left == o.left && top == o.top && right == o.right && bottom == o.bottom;
+        /** True when the other area lies inside this one (a button and its own label, or the same view twice). */
+        boolean contains(Item o) {
+            return left <= o.left && top <= o.top && right >= o.right && bottom >= o.bottom;
+        }
+
+        long area() {
+            return (long) (right - left) * (bottom - top);
         }
 
         String describe() {
@@ -150,10 +158,18 @@ final class AnswerLocator {
         return sb.toString();
     }
 
-    /** Two entries for the same view (a button and its label) are one candidate. */
+    /**
+     * Two entries for one option (a button that carries the text as its description, and the label inside it) are one
+     * candidate. The clickable one is kept, else the smaller one, whose centre is the more precise.
+     */
     private static void addOnce(List<Item> list, Item item) {
-        for (Item existing : list) {
-            if (existing.sameArea(item)) {
+        for (int i = 0; i < list.size(); i++) {
+            Item existing = list.get(i);
+            if (existing.contains(item) || item.contains(existing)) {
+                boolean better = item.clickable != existing.clickable ? item.clickable : item.area() < existing.area();
+                if (better) {
+                    list.set(i, item);
+                }
                 return;
             }
         }
@@ -202,9 +218,12 @@ final class AnswerLocator {
         return out;
     }
 
-    /** "B. Paris" -> "Paris", "(c) Paris" -> "Paris", "2) Paris" -> "Paris". */
+    /**
+     * "B. Paris" -> "Paris", "(c) Paris" -> "Paris", "2) Paris" -> "Paris", "B - Paris" -> "Paris". A space must follow
+     * the mark, so "3.5" or "e-mail" stay as they are.
+     */
     static String stripLabel(String text) {
-        return text.trim().replaceFirst("^[(\\[]?[\\p{L}\\p{N}]{1,2}[)\\].:\\-–]\\s+", "");
+        return text.trim().replaceFirst("^[(\\[]?[\\p{L}\\p{N}]{1,2}\\s*[)\\].:\\-\u2013\u2014]\\s+", "");
     }
 
     /** Lower case, letters and digits only, one space between words; accents and Arabic marks are dropped. */
@@ -216,7 +235,7 @@ final class AnswerLocator {
             char c = lower.charAt(i);
             int type = Character.getType(c);
             if (type == Character.NON_SPACING_MARK || type == Character.COMBINING_SPACING_MARK
-                    || c == 'ـ' /* Arabic tatweel */ || c == '‎' || c == '‏') {
+                    || c == '\u0640' /* Arabic tatweel */ || c == '\u200e' || c == '\u200f') {
                 continue;
             }
             if (Character.isLetterOrDigit(c)) {

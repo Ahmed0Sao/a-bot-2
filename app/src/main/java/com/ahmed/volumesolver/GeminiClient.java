@@ -382,7 +382,7 @@ final class GeminiClient {
         } catch (JSONException e) {
             // Small models sometimes put unescaped quotes into the quoted evidence. The answer and the box are what
             // matters, so take them out of the text directly.
-            JSONObject rescued = rescue(body);
+            JSONObject rescued = rescue(body, isDeepSeek(model));
             if (rescued == null) {
                 throw new IOException("Reply from " + model + " is not valid JSON (" + e.getMessage() + "): " + reply);
             }
@@ -402,8 +402,11 @@ final class GeminiClient {
     private static final Pattern BOX = Pattern.compile("\"box_2d\"\\s*:\\s*\\[\\s*(-?[0-9.]+)\\s*,\\s*(-?[0-9.]+)\\s*,"
             + "\\s*(-?[0-9.]+)\\s*,\\s*(-?[0-9.]+)\\s*\\]");
 
-    /** Null if the text has no usable answer and box. */
-    private static JSONObject rescue(String body) throws JSONException {
+    /**
+     * Null if the text has no usable answer, or no usable box when a box is required (for DeepSeek it is not: its
+     * tap position comes from the screen text).
+     */
+    private static JSONObject rescue(String body, boolean boxOptional) throws JSONException {
         Matcher f = FOUND.matcher(body);
         boolean found = !f.find() || f.group(1).equals("true");
         JSONObject out = new JSONObject().put("found", found);
@@ -433,7 +436,7 @@ final class GeminiClient {
             }
             out.put("box_2d", box);
         }
-        return !found || (hasAnswer && hasBox) ? out : null;
+        return !found || (hasAnswer && (hasBox || boxOptional)) ? out : null;
     }
 
     private static String unescape(String s) {
@@ -813,21 +816,24 @@ final class GeminiClient {
                             + "one key press.";
                     continue;
                 }
-                if (error instanceof IOException && isNetworkFailure((IOException) error)) {
-                    // The connection to this model broke (reset, aborted, TLS, DNS ...). That says nothing about the
-                    // other models, so they are still tried; only when none is left does the key press fail.
+                if (error instanceof IOException || error instanceof JSONException) {
+                    // The connection to this model broke (reset, aborted, TLS, DNS ...), or its reply could not be
+                    // used (empty, blocked, not JSON). That says nothing about the other models, so they are still
+                    // tried; only when none is left does the key press fail with this error.
                     boolean others = !running.isEmpty() || next < order.size();
                     if (!others) {
-                        throw (IOException) error;
+                        rethrow(error);
                     }
-                    String why = "network error " + error.getClass().getSimpleName() + ": " + error.getMessage();
+                    boolean network = error instanceof IOException && isNetworkFailure((IOException) error);
+                    String why = (network ? "network error " : "unusable reply ") + error.getClass().getSimpleName()
+                            + ": " + error.getMessage();
                     Logs.i(ctx, TAG, r.model + " cannot answer: " + why + (running.isEmpty()
                             ? ". Trying the next model." : ". Waiting for the model that is still running."));
                     notes.add(r.model + ": " + why);
                     lastDetail = why;
                     continue;
                 }
-                rethrow(error); // an unreadable reply, a bug ...: ends the key press like before
+                rethrow(error); // a bug (RuntimeException, Error): ends the key press
             }
         } finally {
             for (Racer waiting : running) {
@@ -1197,7 +1203,10 @@ final class GeminiClient {
                 .put("messages", new JSONArray().put(message))
                 .put("stream", false);
         boolean thinkingOn = level.equals("medium") || level.equals("high");
-        body.put("max_tokens", thinkingOn ? 8192 : 2048);
+        // Thinking is DeepSeek's default: only a request that switches it off is sure to need little room. The
+        // thinking may count against max_tokens, and a cap it uses up gives an empty answer.
+        boolean thinkingOff = options && (level.equals("minimal") || level.equals("low"));
+        body.put("max_tokens", thinkingOff ? 2048 : 8192);
         if (options) {
             if (json) {
                 body.put("response_format", new JSONObject().put("type", "json_object"));
@@ -1349,9 +1358,18 @@ final class GeminiClient {
                 if (attempt.cancelled) {
                     throw new CancelledException(name); // another model answered first; say nothing about this one
                 }
-                Logs.i(ctx, TAG, "HTTP " + code + " in " + (done - t0) + " ms (" + name + ": connect "
-                        + (connected - t0) + " ms, send and wait for the model " + (headers - connected)
-                        + " ms, download " + (done - headers) + " ms, reply " + sizeText(responseBody.length()) + ")");
+                if (route.equals(ROUTE_DEEPSEEK)) {
+                    // DeepSeek answers with the headers at once and keeps the connection alive while the model
+                    // works, so most of the model's time is in the second part, not the first.
+                    Logs.i(ctx, TAG, "HTTP " + code + " in " + (done - t0) + " ms (" + name + ": connect "
+                            + (connected - t0) + " ms, send and get the headers " + (headers - connected)
+                            + " ms, model and reply " + (done - headers) + " ms, reply " + sizeText(responseBody.length())
+                            + ")");
+                } else {
+                    Logs.i(ctx, TAG, "HTTP " + code + " in " + (done - t0) + " ms (" + name + ": connect "
+                            + (connected - t0) + " ms, send and wait for the model " + (headers - connected)
+                            + " ms, download " + (done - headers) + " ms, reply " + sizeText(responseBody.length()) + ")");
+                }
                 if (code < 400) {
                     logUsage(ctx, name, responseBody);
                     return responseBody;
@@ -1413,10 +1431,30 @@ final class GeminiClient {
         }
     }
 
-    /** A broken connection: reset, aborted, closed early, TLS or DNS trouble. Not an answer of the server. */
-    private static boolean isNetworkFailure(IOException e) {
-        return e instanceof SocketException || e instanceof EOFException || e instanceof SSLException
-                || e instanceof UnknownHostException || e instanceof ProtocolException;
+    /**
+     * A broken connection: reset, aborted, closed early, a connection that could not be made in time, TLS or DNS
+     * trouble. Not an answer of the server. Android often wraps the real cause ("unexpected end of stream" around an
+     * EOFException), so the causes are looked at too. Read timeouts never get here: they become a
+     * {@link SlowResponseException} first.
+     */
+    static boolean isNetworkFailure(IOException e) {
+        if (e instanceof ApiException || e instanceof SlowResponseException || e instanceof CancelledException) {
+            return false;
+        }
+        Throwable t = e;
+        for (int depth = 0; t != null && depth < 6; depth++, t = t.getCause()) {
+            if (t instanceof SocketException || t instanceof EOFException || t instanceof SSLException
+                    || t instanceof UnknownHostException || t instanceof ProtocolException
+                    || t instanceof SocketTimeoutException) {
+                return true;
+            }
+            String m = t.getMessage() == null ? "" : t.getMessage().toLowerCase(Locale.ROOT);
+            if (m.contains("unexpected end of stream") || m.contains("connection abort")
+                    || m.contains("connection reset") || m.contains("broken pipe")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Sleeps, but ends early with a {@link CancelledException} when the request is cancelled. */
